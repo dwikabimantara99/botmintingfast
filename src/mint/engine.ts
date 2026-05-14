@@ -18,12 +18,14 @@ import {
   loadAccounts,
 } from "../config.js";
 import { logger } from "../logger.js";
+import { emitTelemetrySafe, getTelemetryPath } from "../telemetry.js";
 import type { TargetConfig, WalletProfile } from "../types.js";
 import { buildTransactionPayload } from "./adapter.js";
-import { broadcastSignedTransaction, pingEndpoint } from "./broadcast.js";
+import { broadcastSignedTransaction, pingEndpoint, probeEndpoint, rankHealthyEndpoints } from "./broadcast.js";
+import { calibrateClock, type ClockCalibration } from "./clock.js";
 import {
   getTimeTriggerConfig,
-  logClockStatus,
+  logClockStatusWithCalibration,
   waitForArmWindow,
   waitForPreciseFireWindow,
   waitForTrigger,
@@ -78,6 +80,14 @@ type ReceiptOutcome =
     };
 
 type PreparedLadders = Map<number, PreparedSend[]>;
+
+type LiveFeeMarket = {
+  currentGasPrice: bigint;
+  currentBaseFeePerGas?: bigint;
+  nextBaseFeePerGas?: bigint;
+  suggestedPriorityFeePerGas: bigint;
+  suggestedMaxFeePerGas: bigint;
+};
 
 function buildChain(target: TargetConfig) {
   return defineChain({
@@ -156,6 +166,22 @@ function estimateCostNative(gas: bigint, feeEnvelope: FeeEnvelope): bigint {
   return gas * feeEnvelope.gasPrice;
 }
 
+function maxBigInt(left: bigint, right: bigint): bigint {
+  return left > right ? left : right;
+}
+
+function medianBigInt(values: bigint[]): bigint {
+  if (values.length === 0) return 0n;
+  const sorted = [...values].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  const middle = Math.floor(sorted.length / 2);
+
+  if (sorted.length % 2 === 1) {
+    return sorted[middle]!;
+  }
+
+  return (sorted[middle - 1]! + sorted[middle]!) / 2n;
+}
+
 function isLikelyPropagatedError(message?: string): boolean {
   if (!message) return false;
 
@@ -168,11 +194,60 @@ function isLikelyPropagatedError(message?: string): boolean {
   );
 }
 
+async function sampleLiveFeeMarket(client: PublicClient, configuredPriorityFeePerGas?: bigint): Promise<LiveFeeMarket> {
+  const latestBlock = await client.getBlock();
+  const currentGasPrice = await client.getGasPrice();
+  let nextBaseFeePerGas = latestBlock.baseFeePerGas ?? undefined;
+  let prioritySamples: bigint[] = [];
+
+  try {
+    const feeHistory = await client.getFeeHistory({
+      blockCount: 5,
+      rewardPercentiles: [75],
+    });
+
+    const feeHistoryBase = feeHistory.baseFeePerGas[feeHistory.baseFeePerGas.length - 1];
+    if (feeHistoryBase !== undefined) {
+      nextBaseFeePerGas = feeHistoryBase;
+    }
+
+    prioritySamples = (feeHistory.reward ?? [])
+      .map((rewardRow) => rewardRow[0] ?? 0n)
+      .filter((reward) => reward > 0n);
+  } catch {
+    // Fallback to current gas data if fee history is unavailable.
+  }
+
+  const minimumPriority = configuredPriorityFeePerGas ?? parseGwei("0.05");
+  const suggestedPriorityFeePerGas = maxBigInt(medianBigInt(prioritySamples), minimumPriority);
+  const competitiveMaxFee =
+    nextBaseFeePerGas !== undefined
+      ? maxBigInt(nextBaseFeePerGas * 2n + suggestedPriorityFeePerGas, currentGasPrice + suggestedPriorityFeePerGas)
+      : currentGasPrice + suggestedPriorityFeePerGas;
+
+  const market: LiveFeeMarket = {
+    currentGasPrice,
+    suggestedPriorityFeePerGas,
+    suggestedMaxFeePerGas: competitiveMaxFee,
+  };
+
+  if (latestBlock.baseFeePerGas !== null && latestBlock.baseFeePerGas !== undefined) {
+    market.currentBaseFeePerGas = latestBlock.baseFeePerGas;
+  }
+
+  if (nextBaseFeePerGas !== undefined) {
+    market.nextBaseFeePerGas = nextBaseFeePerGas;
+  }
+
+  return market;
+}
+
 async function resolveFeeEnvelope(
   client: PublicClient,
   target: TargetConfig,
   profile: WalletProfile,
   gasLimit: bigint,
+  liveFeeMarket?: LiveFeeMarket,
   replacementRound = 0,
 ): Promise<FeeEnvelope> {
   const latestBlock = await client.getBlock();
@@ -191,16 +266,25 @@ async function resolveFeeEnvelope(
 
     const targetGasPriceGwei = (targetUsd / assumedNativePriceUsd) * 1_000_000_000 / Number(gasLimit);
     const floorGwei = fees.minFeeFloorGwei ?? 0.5;
-    const cappedTargetGwei = Math.max(targetGasPriceGwei, floorGwei);
-    const adjustedTargetGwei = cappedTargetGwei * totalMultiplier;
-    const cappedFinalGwei =
-      fees.maxFeeCapGwei !== undefined ? Math.min(adjustedTargetGwei, fees.maxFeeCapGwei) : adjustedTargetGwei;
-    const maxFeePerGas = parseGwei(cappedFinalGwei.toFixed(9));
+    const baseTargetGwei = Math.max(targetGasPriceGwei, floorGwei);
+    const adjustedBudgetGwei = baseTargetGwei * totalMultiplier;
+    const liveCompetitiveMaxFee = scaleBigInt(
+      liveFeeMarket?.suggestedMaxFeePerGas ?? (await client.getGasPrice()),
+      totalMultiplier,
+    );
+    const budgetMaxFee = parseGwei(adjustedBudgetGwei.toFixed(9));
+    let maxFeePerGas = maxBigInt(budgetMaxFee, liveCompetitiveMaxFee);
+
+    if (fees.maxFeeCapGwei !== undefined) {
+      const explicitCap = parseGwei(String(fees.maxFeeCapGwei));
+      maxFeePerGas = maxFeePerGas > explicitCap ? explicitCap : maxFeePerGas;
+    }
+
     const priorityFeeBase =
       fees.priorityFeeGwei !== undefined
         ? parseGwei(String(fees.priorityFeeGwei))
-        : parseGwei((Math.max(0.05, cappedFinalGwei * 0.12)).toFixed(9));
-    const scaledPriorityFee = scaleBigInt(priorityFeeBase, replacementMultiplier);
+        : maxBigInt(liveFeeMarket?.suggestedPriorityFeePerGas ?? 0n, parseGwei("0.05"));
+    const scaledPriorityFee = scaleBigInt(scaleBigInt(priorityFeeBase, walletMultiplier), replacementMultiplier);
 
     if (latestBlock.baseFeePerGas == null) {
       return {
@@ -220,7 +304,7 @@ async function resolveFeeEnvelope(
     const gasPrice =
       fees.gasPriceGwei !== undefined
         ? parseGwei(String(fees.gasPriceGwei))
-        : await client.getGasPrice();
+        : liveFeeMarket?.currentGasPrice ?? (await client.getGasPrice());
 
     return {
       type: "legacy",
@@ -228,11 +312,11 @@ async function resolveFeeEnvelope(
     };
   }
 
-  const chainGasPrice = await client.getGasPrice();
+  const chainGasPrice = liveFeeMarket?.suggestedMaxFeePerGas ?? (await client.getGasPrice());
   const priorityFee =
     fees.priorityFeeGwei !== undefined
       ? parseGwei(String(fees.priorityFeeGwei))
-      : 1_000_000_000n;
+      : liveFeeMarket?.suggestedPriorityFeePerGas ?? 1_000_000_000n;
 
   const maxFeeBase =
     fees.maxFeeGwei !== undefined
@@ -252,6 +336,7 @@ async function createPreparedSend(
   account: Account,
   profile: WalletProfile,
   nonceOverride?: number,
+  liveFeeMarket?: LiveFeeMarket,
   replacementRound = 0,
 ): Promise<PreparedSend> {
   const chain = buildChain(target);
@@ -273,7 +358,7 @@ async function createPreparedSend(
       "transaction.gasLimit is required for competition mode so the bot can pre-sign before mint opens.",
     );
   })();
-  const feeEnvelope = await resolveFeeEnvelope(client, target, profile, gasLimit, replacementRound);
+  const feeEnvelope = await resolveFeeEnvelope(client, target, profile, gasLimit, liveFeeMarket, replacementRound);
   const unsignedRequest = buildUnsignedRequest(account, payload, nonce, feeEnvelope);
 
   const request =
@@ -307,11 +392,20 @@ async function prepareSends(
   accounts: Account[],
   profiles: WalletProfile[],
   nonceOverrides?: number[],
+  liveFeeMarket?: LiveFeeMarket,
   replacementRound = 0,
 ): Promise<PreparedSend[]> {
   return Promise.all(
     accounts.map((account, index) =>
-      createPreparedSend(client, target, account, profiles[index]!, nonceOverrides?.[index], replacementRound),
+      createPreparedSend(
+        client,
+        target,
+        account,
+        profiles[index]!,
+        nonceOverrides?.[index],
+        liveFeeMarket,
+        replacementRound,
+      ),
     ),
   );
 }
@@ -323,14 +417,19 @@ async function buildPreparedLadders(
   profiles: WalletProfile[],
   replacementRounds: number,
 ): Promise<PreparedLadders> {
+  const liveFeeMarket = await sampleLiveFeeMarket(
+    client,
+    target.fees.priorityFeeGwei !== undefined ? parseGwei(String(target.fees.priorityFeeGwei)) : undefined,
+  );
+  emitTelemetrySafe("live_fee_market", liveFeeMarket);
   const ladders = await Promise.all(
     accounts.map(async (account, index) => {
       const profile = profiles[index]!;
-      const first = await createPreparedSend(client, target, account, profile);
+      const first = await createPreparedSend(client, target, account, profile, undefined, liveFeeMarket);
       const prepared = [first];
 
       for (let round = 1; round <= replacementRounds; round += 1) {
-        prepared.push(await createPreparedSend(client, target, account, profile, first.nonce, round));
+        prepared.push(await createPreparedSend(client, target, account, profile, first.nonce, liveFeeMarket, round));
       }
 
       return [profile.index, prepared] as const;
@@ -340,19 +439,32 @@ async function buildPreparedLadders(
   return new Map(ladders);
 }
 
-async function warmBroadcastEndpoints(target: TargetConfig): Promise<void> {
+async function warmBroadcastEndpoints(target: TargetConfig): Promise<string[]> {
   const rounds = Math.max(0, target.execution?.warmupRounds ?? 1);
   const delayMs = Math.max(0, target.execution?.warmupDelayMs ?? 100);
-  if (rounds === 0) return;
+  if (rounds === 0) return target.chain.rpc.broadcastHttp;
+
+  let rankedEndpoints = target.chain.rpc.broadcastHttp;
 
   for (let round = 0; round < rounds; round += 1) {
-    const health = await Promise.all(target.chain.rpc.broadcastHttp.map((endpoint) => pingEndpoint(endpoint)));
-    logger.info(`Broadcast warmup round ${round + 1}.`, health);
+    const health = await Promise.all(target.chain.rpc.broadcastHttp.map((endpoint) => probeEndpoint(endpoint)));
+    rankedEndpoints = rankHealthyEndpoints(health, target.chain.rpc.broadcastHttp);
+    logger.info(`Broadcast warmup round ${round + 1}.`, {
+      rankedEndpoints,
+      probes: health,
+    });
+    emitTelemetrySafe("broadcast_warmup_round", {
+      round: round + 1,
+      rankedEndpoints,
+      probes: health,
+    });
 
     if (round < rounds - 1) {
       await sleep(delayMs);
     }
   }
+
+  return rankedEndpoints;
 }
 
 async function waitForReceiptOutcome(
@@ -394,10 +506,25 @@ export async function runStatus(target: TargetConfig): Promise<void> {
 
   const block = await client.getBlockNumber();
   logger.info(`Connected to ${target.chain.name}.`, { block: block.toString() });
-  await logClockStatus(target, client);
+  const clockCalibration = await calibrateClock([
+    target.chain.rpc.primaryHttp,
+    ...target.chain.rpc.broadcastHttp,
+  ]);
+  await logClockStatusWithCalibration(target, client, clockCalibration);
 
-  const latency = await Promise.all(target.chain.rpc.broadcastHttp.map((endpoint) => pingEndpoint(endpoint)));
-  logger.info("Broadcast endpoint health.", latency);
+  const probes = await Promise.all(target.chain.rpc.broadcastHttp.map((endpoint) => probeEndpoint(endpoint)));
+  const rankedEndpoints = rankHealthyEndpoints(probes, target.chain.rpc.broadcastHttp);
+  logger.info("Broadcast endpoint health.", {
+    rankedEndpoints,
+    probes,
+    telemetryPath: getTelemetryPath(),
+  });
+  emitTelemetrySafe("status", {
+    chain: target.chain.name,
+    rankedEndpoints,
+    probes,
+    clockCalibration,
+  });
 }
 
 export async function runValidate(target: TargetConfig): Promise<void> {
@@ -427,8 +554,12 @@ export async function runValidate(target: TargetConfig): Promise<void> {
   );
 
   if (target.trigger.mode === "time") {
+    const clockCalibration = await calibrateClock([
+      target.chain.rpc.primaryHttp,
+      ...target.chain.rpc.broadcastHttp,
+    ]);
     const startAt = new Date(target.trigger.startTimeIso).getTime();
-    const remainingMs = startAt - Date.now();
+    const remainingMs = startAt - clockCalibration.nowMs();
     pushValidation(
       results,
       "Mint schedule",
@@ -436,6 +567,12 @@ export async function runValidate(target: TargetConfig): Promise<void> {
       Number.isFinite(startAt)
         ? `Mint opens at ${new Date(startAt).toISOString()} (${remainingMs} ms from now)`
         : "trigger.startTimeIso tidak valid",
+    );
+    pushValidation(
+      results,
+      "Clock calibration",
+      clockCalibration.sampleCount > 0 && Math.abs(clockCalibration.observedOffsetMs) <= 5000,
+      `appliedOffset=${clockCalibration.offsetMs} ms, observedOffset=${clockCalibration.observedOffsetMs} ms, confidence=${clockCalibration.confidence}, samples=${clockCalibration.sampleCount}, source=${clockCalibration.source}, medianLatency=${clockCalibration.medianLatencyMs} ms`,
     );
   }
 
@@ -495,8 +632,12 @@ export async function runValidate(target: TargetConfig): Promise<void> {
 
   if (gasLimit) {
     const latestBlock = await client.getBlock();
-    const currentGasPrice = await client.getGasPrice();
-    const sampleFee = await resolveFeeEnvelope(client, target, sampleProfile, gasLimit, 0);
+    const liveFeeMarket = await sampleLiveFeeMarket(
+      client,
+      target.fees.priorityFeeGwei !== undefined ? parseGwei(String(target.fees.priorityFeeGwei)) : undefined,
+    );
+    const currentGasPrice = liveFeeMarket.currentGasPrice;
+    const sampleFee = await resolveFeeEnvelope(client, target, sampleProfile, gasLimit, liveFeeMarket, 0);
     const estimatedCost = estimateCostNative(gasLimit, sampleFee);
     const totalRequired = estimatedCost + payload.value;
     const feeText =
@@ -529,7 +670,7 @@ export async function runValidate(target: TargetConfig): Promise<void> {
       "Fee competitiveness now",
       feeCompetitive,
       sampleFee.type === "eip1559"
-        ? `Current gasPrice=${formatGweiValue(currentGasPrice)}, block baseFee=${formatGweiValue(latestBlock.baseFeePerGas ?? 0n)}, configured maxFee=${formatGweiValue(sampleFee.maxFeePerGas)}`
+        ? `Current gasPrice=${formatGweiValue(currentGasPrice)}, block baseFee=${formatGweiValue(latestBlock.baseFeePerGas ?? 0n)}, nextBaseFee=${formatGweiValue(liveFeeMarket.nextBaseFeePerGas ?? 0n)}, configured maxFee=${formatGweiValue(sampleFee.maxFeePerGas)}`
         : `Current gasPrice=${formatGweiValue(currentGasPrice)}, configured gasPrice=${formatGweiValue(sampleFee.gasPrice)}`,
     );
 
@@ -616,6 +757,10 @@ export async function runStandby(target: TargetConfig): Promise<void> {
     chain: buildChain(target),
     transport: http(target.chain.rpc.primaryHttp),
   });
+  const clockCalibration = await calibrateClock([
+    target.chain.rpc.primaryHttp,
+    ...target.chain.rpc.broadcastHttp,
+  ]);
 
   await runStatus(target);
   const timeSchedule = getTimeTriggerConfig(target);
@@ -623,18 +768,26 @@ export async function runStandby(target: TargetConfig): Promise<void> {
   if (timeSchedule) {
     const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
     logger.info("Timed standby active. Bot will arm before mint opens.");
-    await waitForArmWindow(target);
+    await waitForArmWindow(target, clockCalibration);
+    const refreshedClockCalibration = await calibrateClock([
+      target.chain.rpc.primaryHttp,
+      ...target.chain.rpc.broadcastHttp,
+    ]);
     logger.info("Arming timed fire. Preparing signed replacement ladder now.");
+    emitTelemetrySafe("timed_arm", {
+      initialClockOffsetMs: clockCalibration.offsetMs,
+      refreshedClockOffsetMs: refreshedClockCalibration.offsetMs,
+    });
+    const rankedEndpoints = await warmBroadcastEndpoints(target);
     const ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
     const prepared = Array.from(ladders.values()).map((ladder) => ladder[0]!);
-    await warmBroadcastEndpoints(target);
-    await waitForPreciseFireWindow(target);
-    await executePreparedRounds(target, client, prepared, ladders);
+    await waitForPreciseFireWindow(target, refreshedClockCalibration);
+    await executePreparedRounds(target, client, prepared, ladders, rankedEndpoints);
     return;
   }
 
   logger.info("Standby active. Waiting for trigger.");
-  await waitForTrigger(target, client);
+  await waitForTrigger(target, client, clockCalibration);
   await runFire(target, client);
 }
 
@@ -650,7 +803,7 @@ export async function runRehearse(target: TargetConfig): Promise<void> {
   await runStatus(target);
   logger.info("Preparing rehearsal ladder without broadcasting.");
   const ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
-  await warmBroadcastEndpoints(target);
+  const rankedEndpoints = await warmBroadcastEndpoints(target);
 
   const summary = Array.from(ladders.values()).map((ladder) => ({
     wallet: ladder[0]!.account.address,
@@ -663,6 +816,10 @@ export async function runRehearse(target: TargetConfig): Promise<void> {
   }));
 
   logger.success("Rehearsal complete. Fire path can pre-sign all rounds.", summary);
+  emitTelemetrySafe("rehearsal_complete", {
+    rankedEndpoints,
+    summary,
+  });
 }
 
 async function executePreparedRounds(
@@ -670,6 +827,7 @@ async function executePreparedRounds(
   client: PublicClient,
   initialPrepared: PreparedSend[],
   preSignedLadders?: PreparedLadders,
+  broadcastEndpoints?: string[],
 ): Promise<void> {
   let prepared = initialPrepared;
   let bestHashes = new Map<number, Hex>();
@@ -677,6 +835,7 @@ async function executePreparedRounds(
   const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
   const receiptTimeout = target.execution?.receiptTimeoutMs ?? getDefaultReceiptTimeoutMs();
   const terminalStates = new Map<number, ReceiptOutcome>();
+  const activeBroadcastEndpoints = broadcastEndpoints ?? target.chain.rpc.broadcastHttp;
 
   for (let round = 0; round <= replacementRounds; round += 1) {
     if (prepared.length === 0) {
@@ -687,7 +846,7 @@ async function executePreparedRounds(
 
     const perWalletResults = await Promise.all(
       prepared.map(async (send) => {
-        const results = await broadcastSignedTransaction(target.chain.rpc.broadcastHttp, send.serializedTransaction);
+        const results = await broadcastSignedTransaction(activeBroadcastEndpoints, send.serializedTransaction);
         const winner = results.find((item) => item.ok && item.hash);
         const inferredHash = winner?.hash ?? (results.some((item) => isLikelyPropagatedError(item.error)) ? send.transactionHash : undefined);
         return { send, results, inferredHash };
@@ -705,6 +864,18 @@ async function executePreparedRounds(
         bestHashes.set(item.send.profile.index, item.inferredHash);
       }
     }
+
+    emitTelemetrySafe("broadcast_round", {
+      round: round + 1,
+      activeBroadcastEndpoints,
+      perWalletResults: perWalletResults.map((item) => ({
+        wallet: item.send.account.address,
+        profile: item.send.profile.label,
+        nonce: item.send.nonce,
+        inferredHash: item.inferredHash,
+        results: item.results,
+      })),
+    });
 
     const receiptChecks = await Promise.all(
       prepared.map(async (send) => {
@@ -737,11 +908,30 @@ async function executePreparedRounds(
           hash: item.outcome.hash,
         })),
       });
+      emitTelemetrySafe("mint_success", {
+        confirmedWallets: confirmedSuccess.map((item) => ({
+          wallet: item.send.account.address,
+          profile: item.send.profile.label,
+          hash: item.outcome.hash,
+        })),
+        revertedWallets: reverted.map((item) => ({
+          wallet: item.send.account.address,
+          profile: item.send.profile.label,
+          hash: item.outcome.hash,
+        })),
+      });
       return;
     }
 
     if (reverted.length > 0) {
       logger.warn("Some wallets reverted and will not be retried.", {
+        revertedWallets: reverted.map((item) => ({
+          wallet: item.send.account.address,
+          profile: item.send.profile.label,
+          hash: item.outcome.hash,
+        })),
+      });
+      emitTelemetrySafe("wallets_reverted", {
         revertedWallets: reverted.map((item) => ({
           wallet: item.send.account.address,
           profile: item.send.profile.label,
@@ -766,9 +956,13 @@ async function executePreparedRounds(
       continue;
     }
 
+    const liveFeeMarket = await sampleLiveFeeMarket(
+      client,
+      target.fees.priorityFeeGwei !== undefined ? parseGwei(String(target.fees.priorityFeeGwei)) : undefined,
+    );
     prepared = await Promise.all(
       pending.map((item) =>
-        createPreparedSend(client, target, item.send.account, item.send.profile, item.send.nonce, round + 1),
+        createPreparedSend(client, target, item.send.account, item.send.profile, item.send.nonce, liveFeeMarket, round + 1),
       ),
     );
   }
@@ -783,6 +977,7 @@ async function executePreparedRounds(
 
   logger.warn("Fire sequence finished without an early confirmation.", finalChecks);
   logger.info("If receipts are still pending, check explorer or rerun with a more aggressive fee config.");
+  emitTelemetrySafe("fire_finished_without_early_confirmation", finalChecks);
 }
 
 export async function runFire(target: TargetConfig, providedClient?: PublicClient): Promise<void> {
@@ -796,6 +991,11 @@ export async function runFire(target: TargetConfig, providedClient?: PublicClien
     });
 
   logger.info("Preparing signed transactions.");
-  const prepared = await prepareSends(client, target, accounts, profiles);
-  await executePreparedRounds(target, client, prepared);
+  const liveFeeMarket = await sampleLiveFeeMarket(
+    client,
+    target.fees.priorityFeeGwei !== undefined ? parseGwei(String(target.fees.priorityFeeGwei)) : undefined,
+  );
+  const rankedEndpoints = await warmBroadcastEndpoints(target);
+  const prepared = await prepareSends(client, target, accounts, profiles, undefined, liveFeeMarket);
+  await executePreparedRounds(target, client, prepared, undefined, rankedEndpoints);
 }

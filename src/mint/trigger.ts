@@ -3,6 +3,7 @@ import type { PublicClient } from "viem";
 
 import { logger } from "../logger.js";
 import type { TargetConfig } from "../types.js";
+import type { ClockCalibration } from "./clock.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -78,20 +79,36 @@ export function getTimeTriggerConfig(target: TargetConfig): {
 }
 
 export async function logClockStatus(target: TargetConfig, client: PublicClient): Promise<void> {
+  await logClockStatusWithCalibration(target, client);
+}
+
+export async function logClockStatusWithCalibration(
+  target: TargetConfig,
+  client: PublicClient,
+  calibration?: ClockCalibration,
+): Promise<void> {
   const schedule = getTimeTriggerConfig(target);
   if (!schedule) return;
 
   const latestBlock = await client.getBlock();
   const latestBlockTimeMs = Number(latestBlock.timestamp) * 1000;
-  const now = Date.now();
+  const localNow = Date.now();
+  const calibratedNow = calibration?.nowMs() ?? localNow;
 
   logger.info("Clock status.", {
-    localTimeIso: new Date(now).toISOString(),
+    localTimeIso: new Date(localNow).toISOString(),
+    calibratedTimeIso: new Date(calibratedNow).toISOString(),
     targetTimeIso: new Date(schedule.startAtMs).toISOString(),
-    millisecondsUntilTarget: schedule.startAtMs - now,
+    millisecondsUntilTarget: schedule.startAtMs - calibratedNow,
     latestBlockTimestampIso: new Date(latestBlockTimeMs).toISOString(),
-    chainBlockAgeMs: now - latestBlockTimeMs,
+    chainBlockAgeMs: calibratedNow - latestBlockTimeMs,
     armWindowOpensIso: new Date(schedule.armAtMs).toISOString(),
+    clockOffsetMs: calibration?.offsetMs ?? 0,
+    clockObservedOffsetMs: calibration?.observedOffsetMs ?? 0,
+    clockSampleCount: calibration?.sampleCount ?? 0,
+    clockSource: calibration?.source ?? "local-clock",
+    clockMedianLatencyMs: calibration?.medianLatencyMs ?? 0,
+    clockConfidence: calibration?.confidence ?? "low",
   });
 }
 
@@ -100,11 +117,12 @@ async function waitUntilTimestamp(
   pollIntervalMs: number,
   countdownIntervalMs: number,
   label: string,
+  calibration?: ClockCalibration,
 ): Promise<void> {
   let lastNoticeAt = 0;
 
   while (true) {
-    const remainingMs = targetMs - Date.now();
+    const remainingMs = targetMs - (calibration?.nowMs() ?? Date.now());
     if (remainingMs <= 0) {
       return;
     }
@@ -128,15 +146,18 @@ async function waitUntilTimestamp(
 }
 
 function spinUntilTimestamp(targetMs: number): void {
-  if (Date.now() >= targetMs) return;
+  spinUntilTimestampWithCalibration(targetMs);
+}
 
-  const targetPerf = performance.now() + (targetMs - Date.now());
-  while (performance.now() < targetPerf) {
+function spinUntilTimestampWithCalibration(targetMs: number, calibration?: ClockCalibration): void {
+  if ((calibration?.nowMs() ?? Date.now()) >= targetMs) return;
+
+  while ((calibration?.nowMs() ?? Date.now()) < targetMs) {
     // Intentional short busy wait for the final timing window.
   }
 }
 
-export async function waitForArmWindow(target: TargetConfig): Promise<void> {
+export async function waitForArmWindow(target: TargetConfig, calibration?: ClockCalibration): Promise<void> {
   const schedule = getTimeTriggerConfig(target);
   if (!schedule) return;
 
@@ -145,20 +166,21 @@ export async function waitForArmWindow(target: TargetConfig): Promise<void> {
     schedule.pollIntervalMs,
     schedule.countdownIntervalMs,
     "Arm window opens",
+    calibration,
   );
   logger.success("Arm window reached.");
 }
 
-export async function waitForPreciseFireWindow(target: TargetConfig): Promise<void> {
+export async function waitForPreciseFireWindow(target: TargetConfig, calibration?: ClockCalibration): Promise<void> {
   const schedule = getTimeTriggerConfig(target);
   if (!schedule) return;
 
-  const msUntilFinalSpin = schedule.startAtMs - Date.now() - schedule.finalSpinWindowMs;
+  const msUntilFinalSpin = schedule.startAtMs - (calibration?.nowMs() ?? Date.now()) - schedule.finalSpinWindowMs;
   if (msUntilFinalSpin > 0) {
     await sleep(msUntilFinalSpin);
   }
 
-  const remainingBeforeSpin = schedule.startAtMs - Date.now();
+  const remainingBeforeSpin = schedule.startAtMs - (calibration?.nowMs() ?? Date.now());
   if (remainingBeforeSpin > 0) {
     logger.info("Final timing window active.", {
       targetTimeIso: new Date(schedule.startAtMs).toISOString(),
@@ -167,11 +189,15 @@ export async function waitForPreciseFireWindow(target: TargetConfig): Promise<vo
     });
   }
 
-  spinUntilTimestamp(schedule.startAtMs);
+  spinUntilTimestampWithCalibration(schedule.startAtMs, calibration);
   logger.success("Exact fire time reached.");
 }
 
-export async function waitForTrigger(target: TargetConfig, client: PublicClient): Promise<void> {
+export async function waitForTrigger(
+  target: TargetConfig,
+  client: PublicClient,
+  calibration?: ClockCalibration,
+): Promise<void> {
   const trigger = target.trigger;
 
   if (trigger.mode === "manual") {
@@ -188,6 +214,7 @@ export async function waitForTrigger(target: TargetConfig, client: PublicClient)
       schedule.pollIntervalMs,
       schedule.countdownIntervalMs,
       "Mint opens",
+      calibration,
     );
 
     logger.success("Time trigger reached.");
