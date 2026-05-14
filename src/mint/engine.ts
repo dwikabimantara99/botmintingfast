@@ -1,5 +1,4 @@
 import {
-  createPublicClient,
   createWalletClient,
   defineChain,
   formatEther,
@@ -9,7 +8,6 @@ import {
   type AccessList,
   type Account,
   type Hex,
-  type PublicClient,
 } from "viem";
 
 import {
@@ -23,11 +21,13 @@ import type { TargetConfig, WalletProfile } from "../types.js";
 import { buildTransactionPayload } from "./adapter.js";
 import { broadcastSignedTransaction, pingEndpoint, probeEndpoint, rankHealthyEndpoints } from "./broadcast.js";
 import { calibrateClock, type ClockCalibration } from "./clock.js";
+import { createRpcMesh, type RpcReadClient } from "./rpcMesh.js";
 import {
   getTimeTriggerConfig,
   logClockStatusWithCalibration,
   waitForArmWindow,
   waitForPreciseFireWindow,
+  waitForTimedCheckpoint,
   waitForTrigger,
 } from "./trigger.js";
 
@@ -62,6 +62,7 @@ type FeeEnvelope =
 type ValidationItem = {
   check: string;
   ok: boolean;
+  severity: "block" | "risk";
   details: string;
 };
 
@@ -124,8 +125,26 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
-function pushValidation(results: ValidationItem[], check: string, ok: boolean, details: string): void {
-  results.push({ check, ok, details });
+function pushValidation(
+  results: ValidationItem[],
+  check: string,
+  ok: boolean,
+  details: string,
+  severity: "block" | "risk" = "block",
+): void {
+  results.push({ check, ok, details, severity });
+}
+
+function summarizeReadiness(results: ValidationItem[]): "READY" | "RISKY" | "BLOCKED" {
+  if (results.some((item) => !item.ok && item.severity === "block")) {
+    return "BLOCKED";
+  }
+
+  if (results.some((item) => !item.ok && item.severity === "risk")) {
+    return "RISKY";
+  }
+
+  return "READY";
 }
 
 function buildUnsignedRequest(
@@ -194,7 +213,7 @@ function isLikelyPropagatedError(message?: string): boolean {
   );
 }
 
-async function sampleLiveFeeMarket(client: PublicClient, configuredPriorityFeePerGas?: bigint): Promise<LiveFeeMarket> {
+async function sampleLiveFeeMarket(client: RpcReadClient, configuredPriorityFeePerGas?: bigint): Promise<LiveFeeMarket> {
   const latestBlock = await client.getBlock();
   const currentGasPrice = await client.getGasPrice();
   let nextBaseFeePerGas = latestBlock.baseFeePerGas ?? undefined;
@@ -243,7 +262,7 @@ async function sampleLiveFeeMarket(client: PublicClient, configuredPriorityFeePe
 }
 
 async function resolveFeeEnvelope(
-  client: PublicClient,
+  client: RpcReadClient,
   target: TargetConfig,
   profile: WalletProfile,
   gasLimit: bigint,
@@ -331,7 +350,7 @@ async function resolveFeeEnvelope(
 }
 
 async function createPreparedSend(
-  client: PublicClient,
+  client: RpcReadClient,
   target: TargetConfig,
   account: Account,
   profile: WalletProfile,
@@ -387,7 +406,7 @@ async function createPreparedSend(
 }
 
 async function prepareSends(
-  client: PublicClient,
+  client: RpcReadClient,
   target: TargetConfig,
   accounts: Account[],
   profiles: WalletProfile[],
@@ -411,7 +430,7 @@ async function prepareSends(
 }
 
 async function buildPreparedLadders(
-  client: PublicClient,
+  client: RpcReadClient,
   target: TargetConfig,
   accounts: Account[],
   profiles: WalletProfile[],
@@ -468,7 +487,7 @@ async function warmBroadcastEndpoints(target: TargetConfig): Promise<string[]> {
 }
 
 async function waitForReceiptOutcome(
-  client: PublicClient,
+  client: RpcReadClient,
   hash: Hex,
   timeoutMs: number,
 ): Promise<ReceiptOutcome> {
@@ -494,10 +513,8 @@ async function waitForReceiptOutcome(
 
 export async function runStatus(target: TargetConfig): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
-  const client = createPublicClient({
-    chain: buildChain(target),
-    transport: http(target.chain.rpc.primaryHttp),
-  });
+  const client = createRpcMesh(target);
+  await client.refreshRanking();
 
   logger.info("Wallets loaded.", {
     count: accounts.length,
@@ -530,10 +547,8 @@ export async function runStatus(target: TargetConfig): Promise<void> {
 export async function runValidate(target: TargetConfig): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
   const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
-  const client = createPublicClient({
-    chain: buildChain(target),
-    transport: http(target.chain.rpc.primaryHttp),
-  });
+  const client = createRpcMesh(target);
+  await client.refreshRanking();
   const results: ValidationItem[] = [];
 
   const chainId = await client.getChainId();
@@ -558,6 +573,7 @@ export async function runValidate(target: TargetConfig): Promise<void> {
       target.chain.rpc.primaryHttp,
       ...target.chain.rpc.broadcastHttp,
     ]);
+    const schedule = getTimeTriggerConfig(target);
     const startAt = new Date(target.trigger.startTimeIso).getTime();
     const remainingMs = startAt - clockCalibration.nowMs();
     pushValidation(
@@ -568,11 +584,23 @@ export async function runValidate(target: TargetConfig): Promise<void> {
         ? `Mint opens at ${new Date(startAt).toISOString()} (${remainingMs} ms from now)`
         : "trigger.startTimeIso tidak valid",
     );
+    if (schedule && schedule.repriceBeforeMs !== null) {
+      pushValidation(
+        results,
+        "Timed reprice window",
+        schedule.repriceAtMs !== null,
+        schedule.repriceAtMs !== null
+          ? `Final reprice scheduled ${schedule.repriceBeforeMs} ms before mint open.`
+          : `repriceBeforeMs=${schedule.repriceBeforeMs} ms is too tight for armBeforeMs=${schedule.armBeforeMs} ms and finalSpinWindowMs=${schedule.finalSpinWindowMs} ms.`,
+        "risk",
+      );
+    }
     pushValidation(
       results,
       "Clock calibration",
       clockCalibration.sampleCount > 0 && Math.abs(clockCalibration.observedOffsetMs) <= 5000,
       `appliedOffset=${clockCalibration.offsetMs} ms, observedOffset=${clockCalibration.observedOffsetMs} ms, confidence=${clockCalibration.confidence}, samples=${clockCalibration.sampleCount}, source=${clockCalibration.source}, medianLatency=${clockCalibration.medianLatencyMs} ms`,
+      "risk",
     );
   }
 
@@ -596,6 +624,30 @@ export async function runValidate(target: TargetConfig): Promise<void> {
       hasPriceAssumption
         ? `Target fee around $${target.fees.targetUsd ?? 2.5} with native price assumption $${target.fees.assumedNativePriceUsd}`
         : "fees.assumedNativePriceUsd wajib diisi untuk budgetAggressive",
+    );
+  }
+
+  const latestNonceChecks = await Promise.all(
+    accounts.map(async (account) => ({
+      address: account.address,
+      latestNonce: await client.getTransactionCount({
+        address: account.address,
+        blockTag: "latest",
+      }),
+      pendingNonce: await client.getTransactionCount({
+        address: account.address,
+        blockTag: "pending",
+      }),
+    })),
+  );
+
+  for (const nonceCheck of latestNonceChecks) {
+    pushValidation(
+      results,
+      `Pending nonce ${nonceCheck.address.slice(0, 8)}`,
+      nonceCheck.pendingNonce === nonceCheck.latestNonce,
+      `latest=${nonceCheck.latestNonce}, pending=${nonceCheck.pendingNonce}`,
+      "risk",
     );
   }
 
@@ -672,6 +724,7 @@ export async function runValidate(target: TargetConfig): Promise<void> {
       sampleFee.type === "eip1559"
         ? `Current gasPrice=${formatGweiValue(currentGasPrice)}, block baseFee=${formatGweiValue(latestBlock.baseFeePerGas ?? 0n)}, nextBaseFee=${formatGweiValue(liveFeeMarket.nextBaseFeePerGas ?? 0n)}, configured maxFee=${formatGweiValue(sampleFee.maxFeePerGas)}`
         : `Current gasPrice=${formatGweiValue(currentGasPrice)}, configured gasPrice=${formatGweiValue(sampleFee.gasPrice)}`,
+      "risk",
     );
 
     try {
@@ -740,26 +793,35 @@ export async function runValidate(target: TargetConfig): Promise<void> {
     );
   }
 
-  const allPassed = results.every((item) => item.ok);
-  logger.info("Preflight validation summary.", results);
+  const readiness = summarizeReadiness(results);
+  logger.info("Preflight validation summary.", {
+    readiness,
+    telemetryPath: getTelemetryPath(),
+    results,
+  });
 
-  if (allPassed) {
+  if (readiness === "READY") {
     logger.success("Validation passed. Bot is ready for armed standby.");
-  } else {
-    logger.warn("Validation found issues. Fix the failed checks before the competition.");
+    return;
   }
+
+  if (readiness === "RISKY") {
+    logger.warn("Validation is risky. The bot can run, but you should fix the warnings before the competition.");
+    return;
+  }
+
+  logger.warn("Validation is blocked. Fix the blocking issues before the competition.");
 }
 
 export async function runStandby(target: TargetConfig): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
   const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
-  const client = createPublicClient({
-    chain: buildChain(target),
-    transport: http(target.chain.rpc.primaryHttp),
-  });
+  const client = createRpcMesh(target);
+  await client.refreshRanking();
   const clockCalibration = await calibrateClock([
     target.chain.rpc.primaryHttp,
     ...target.chain.rpc.broadcastHttp,
+    ...(target.chain.rpc.readHttp ?? []),
   ]);
 
   await runStatus(target);
@@ -769,9 +831,11 @@ export async function runStandby(target: TargetConfig): Promise<void> {
     const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
     logger.info("Timed standby active. Bot will arm before mint opens.");
     await waitForArmWindow(target, clockCalibration);
+    await client.refreshRanking();
     const refreshedClockCalibration = await calibrateClock([
       target.chain.rpc.primaryHttp,
       ...target.chain.rpc.broadcastHttp,
+      ...(target.chain.rpc.readHttp ?? []),
     ]);
     logger.info("Arming timed fire. Preparing signed replacement ladder now.");
     emitTelemetrySafe("timed_arm", {
@@ -779,9 +843,60 @@ export async function runStandby(target: TargetConfig): Promise<void> {
       refreshedClockOffsetMs: refreshedClockCalibration.offsetMs,
     });
     const rankedEndpoints = await warmBroadcastEndpoints(target);
-    const ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
+    let ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
+    let fireCalibration = refreshedClockCalibration;
+
+    if (timeSchedule.repriceAtMs !== null) {
+      const remainingUntilRepriceMs = timeSchedule.repriceAtMs - fireCalibration.nowMs();
+      if (remainingUntilRepriceMs > 0) {
+        logger.info("Initial ladder prepared. Final fee refresh is scheduled before fire.", {
+          repriceBeforeMs: timeSchedule.repriceBeforeMs,
+          repriceAtIso: new Date(timeSchedule.repriceAtMs).toISOString(),
+          remainingUntilRepriceMs,
+        });
+        await waitForTimedCheckpoint(
+          target,
+          timeSchedule.repriceAtMs,
+          "Final fee refresh window",
+          fireCalibration,
+          true,
+        );
+        await client.refreshRanking();
+        const finalRepriceCalibration = await calibrateClock([
+          target.chain.rpc.primaryHttp,
+          ...target.chain.rpc.broadcastHttp,
+          ...(target.chain.rpc.readHttp ?? []),
+        ]);
+
+        try {
+          logger.info("Refreshing live fee market and re-signing ladder close to mint open.");
+          ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
+          fireCalibration = finalRepriceCalibration;
+          emitTelemetrySafe("timed_reprice_success", {
+            repriceBeforeMs: timeSchedule.repriceBeforeMs,
+            finalClockOffsetMs: finalRepriceCalibration.offsetMs,
+            finalObservedClockOffsetMs: finalRepriceCalibration.observedOffsetMs,
+            finalClockConfidence: finalRepriceCalibration.confidence,
+          });
+        } catch (error) {
+          logger.warn("Final reprice failed. Keeping the initial signed ladder.", {
+            error: describeError(error),
+          });
+          emitTelemetrySafe("timed_reprice_failed", {
+            repriceBeforeMs: timeSchedule.repriceBeforeMs,
+            error: describeError(error),
+          });
+        }
+      } else {
+        logger.warn("Final fee refresh window already passed. Using the initial ladder.", {
+          repriceBeforeMs: timeSchedule.repriceBeforeMs,
+          remainingUntilRepriceMs,
+        });
+      }
+    }
+
     const prepared = Array.from(ladders.values()).map((ladder) => ladder[0]!);
-    await waitForPreciseFireWindow(target, refreshedClockCalibration);
+    await waitForPreciseFireWindow(target, fireCalibration);
     await executePreparedRounds(target, client, prepared, ladders, rankedEndpoints);
     return;
   }
@@ -794,10 +909,8 @@ export async function runStandby(target: TargetConfig): Promise<void> {
 export async function runRehearse(target: TargetConfig): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
   const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
-  const client = createPublicClient({
-    chain: buildChain(target),
-    transport: http(target.chain.rpc.primaryHttp),
-  });
+  const client = createRpcMesh(target);
+  await client.refreshRanking();
   const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
 
   await runStatus(target);
@@ -824,7 +937,7 @@ export async function runRehearse(target: TargetConfig): Promise<void> {
 
 async function executePreparedRounds(
   target: TargetConfig,
-  client: PublicClient,
+  client: RpcReadClient,
   initialPrepared: PreparedSend[],
   preSignedLadders?: PreparedLadders,
   broadcastEndpoints?: string[],
@@ -980,15 +1093,13 @@ async function executePreparedRounds(
   emitTelemetrySafe("fire_finished_without_early_confirmation", finalChecks);
 }
 
-export async function runFire(target: TargetConfig, providedClient?: PublicClient): Promise<void> {
+export async function runFire(target: TargetConfig, providedClient?: RpcReadClient): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
   const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
-  const client =
-    providedClient ??
-    createPublicClient({
-      chain: buildChain(target),
-      transport: http(target.chain.rpc.primaryHttp),
-    });
+  const client = providedClient ?? createRpcMesh(target);
+  if ("refreshRanking" in client && typeof client.refreshRanking === "function") {
+    await client.refreshRanking();
+  }
 
   logger.info("Preparing signed transactions.");
   const liveFeeMarket = await sampleLiveFeeMarket(

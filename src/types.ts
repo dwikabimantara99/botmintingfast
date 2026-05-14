@@ -9,6 +9,7 @@ export type TriggerConfig =
       startTimeIso: string;
       pollIntervalMs?: number;
       armBeforeMs?: number;
+      repriceBeforeMs?: number;
       countdownIntervalMs?: number;
       finalSpinWindowMs?: number;
     }
@@ -83,6 +84,7 @@ export type TargetConfig = {
     rpc: {
       primaryHttp: string;
       broadcastHttp: string[];
+      readHttp?: string[];
       webSocket?: string;
     };
   };

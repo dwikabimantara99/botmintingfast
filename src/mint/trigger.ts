@@ -1,12 +1,44 @@
 import { decodeFunctionResult, encodeFunctionData, parseAbi, type Abi } from "viem";
-import type { PublicClient } from "viem";
 
 import { logger } from "../logger.js";
 import type { TargetConfig } from "../types.js";
 import type { ClockCalibration } from "./clock.js";
+import type { RpcReadClient } from "./rpcMesh.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getWebSocketCtor():
+  | (new (url: string | URL, protocols?: string | string[]) => WebSocket)
+  | undefined {
+  return typeof WebSocket === "undefined" ? undefined : WebSocket;
+}
+
+function safeParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseHexBlockNumber(value: unknown): bigint | null {
+  if (typeof value !== "string" || value.length === 0) {
+    return null;
+  }
+
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function createTimeoutError(message: string): Error {
+  const error = new Error(message);
+  error.name = "TimeoutError";
+  return error;
 }
 
 function toComparable(value: unknown): string {
@@ -55,6 +87,9 @@ function normalizeAbi(abi: Abi | readonly string[]): Abi {
 export function getTimeTriggerConfig(target: TargetConfig): {
   startAtMs: number;
   armAtMs: number;
+  armBeforeMs: number;
+  repriceBeforeMs: number | null;
+  repriceAtMs: number | null;
   pollIntervalMs: number;
   countdownIntervalMs: number;
   finalSpinWindowMs: number;
@@ -68,23 +103,37 @@ export function getTimeTriggerConfig(target: TargetConfig): {
   }
 
   const armBeforeMs = trigger.armBeforeMs ?? 4000;
+  const finalSpinWindowMs = Math.max(10, trigger.finalSpinWindowMs ?? 125);
+  const rawRepriceBeforeMs = trigger.repriceBeforeMs ?? 900;
+  const repriceBeforeMs = rawRepriceBeforeMs > 0 ? rawRepriceBeforeMs : null;
+  const candidateRepriceAtMs = repriceBeforeMs !== null ? startAtMs - repriceBeforeMs : null;
+  const repriceAtMs =
+    candidateRepriceAtMs !== null &&
+    candidateRepriceAtMs > startAtMs - armBeforeMs &&
+    repriceBeforeMs !== null &&
+    repriceBeforeMs > finalSpinWindowMs + 25
+      ? candidateRepriceAtMs
+      : null;
 
   return {
     startAtMs,
     armAtMs: startAtMs - Math.max(0, armBeforeMs),
+    armBeforeMs,
+    repriceBeforeMs,
+    repriceAtMs,
     pollIntervalMs: trigger.pollIntervalMs ?? 200,
     countdownIntervalMs: trigger.countdownIntervalMs ?? 15000,
-    finalSpinWindowMs: Math.max(10, trigger.finalSpinWindowMs ?? 125),
+    finalSpinWindowMs,
   };
 }
 
-export async function logClockStatus(target: TargetConfig, client: PublicClient): Promise<void> {
+export async function logClockStatus(target: TargetConfig, client: RpcReadClient): Promise<void> {
   await logClockStatusWithCalibration(target, client);
 }
 
 export async function logClockStatusWithCalibration(
   target: TargetConfig,
-  client: PublicClient,
+  client: RpcReadClient,
   calibration?: ClockCalibration,
 ): Promise<void> {
   const schedule = getTimeTriggerConfig(target);
@@ -145,10 +194,6 @@ async function waitUntilTimestamp(
   }
 }
 
-function spinUntilTimestamp(targetMs: number): void {
-  spinUntilTimestampWithCalibration(targetMs);
-}
-
 function spinUntilTimestampWithCalibration(targetMs: number, calibration?: ClockCalibration): void {
   if ((calibration?.nowMs() ?? Date.now()) >= targetMs) return;
 
@@ -169,6 +214,39 @@ export async function waitForArmWindow(target: TargetConfig, calibration?: Clock
     calibration,
   );
   logger.success("Arm window reached.");
+}
+
+export async function waitForTimedCheckpoint(
+  target: TargetConfig,
+  checkpointMs: number,
+  label: string,
+  calibration?: ClockCalibration,
+  quiet = false,
+): Promise<void> {
+  const schedule = getTimeTriggerConfig(target);
+  if (!schedule) return;
+
+  if (quiet) {
+    while (true) {
+      const remainingMs = checkpointMs - (calibration?.nowMs() ?? Date.now());
+      if (remainingMs <= 0) {
+        break;
+      }
+
+      const nextSleep = Math.min(schedule.pollIntervalMs, Math.max(remainingMs - 5, 1));
+      await sleep(nextSleep);
+    }
+  } else {
+    await waitUntilTimestamp(
+      checkpointMs,
+      schedule.pollIntervalMs,
+      schedule.countdownIntervalMs,
+      label,
+      calibration,
+    );
+  }
+
+  logger.success(`${label} reached.`);
 }
 
 export async function waitForPreciseFireWindow(target: TargetConfig, calibration?: ClockCalibration): Promise<void> {
@@ -193,9 +271,178 @@ export async function waitForPreciseFireWindow(target: TargetConfig, calibration
   logger.success("Exact fire time reached.");
 }
 
+async function waitForBlockTriggerByPolling(client: RpcReadClient, targetBlock: bigint, pollIntervalMs: number): Promise<void> {
+  while (true) {
+    const current = await client.getBlockNumber();
+    if (current >= targetBlock) {
+      logger.success(`Block trigger reached at block ${current.toString()}.`);
+      return;
+    }
+
+    await sleep(pollIntervalMs);
+  }
+}
+
+async function waitForBlockTriggerByWebSocket(
+  webSocketUrl: string,
+  targetBlock: bigint,
+  stallTimeoutMs: number,
+): Promise<void> {
+  const WebSocketCtor = getWebSocketCtor();
+  if (!WebSocketCtor) {
+    throw new Error("WebSocket runtime is unavailable in this Node environment.");
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let socketClosedByBot = false;
+    let subscriptionId: string | undefined;
+    let rpcRequestId = 1;
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    let openTimer: ReturnType<typeof setTimeout> | undefined;
+    let socket: WebSocket | undefined;
+
+    function clearTimers(): void {
+      if (stallTimer) clearTimeout(stallTimer);
+      if (openTimer) clearTimeout(openTimer);
+    }
+
+    function cleanup(): void {
+      clearTimers();
+      if (socket) {
+        socket.removeEventListener("open", handleOpen);
+        socket.removeEventListener("message", handleMessage);
+        socket.removeEventListener("error", handleError);
+        socket.removeEventListener("close", handleClose);
+      }
+    }
+
+    function finish(error?: Error): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+
+      if (socket && socket.readyState === socket.OPEN) {
+        socketClosedByBot = true;
+        socket.close(1000, error ? "fallback-to-polling" : "target-block-reached");
+      }
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    }
+
+    function refreshStallTimer(): void {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        finish(createTimeoutError(`WebSocket newHeads stalled for more than ${stallTimeoutMs} ms.`));
+      }, stallTimeoutMs);
+    }
+
+    function handleOpen(): void {
+      if (!socket) return;
+
+      if (openTimer) {
+        clearTimeout(openTimer);
+        openTimer = undefined;
+      }
+
+      refreshStallTimer();
+      socket.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: rpcRequestId,
+          method: "eth_subscribe",
+          params: ["newHeads"],
+        }),
+      );
+      rpcRequestId += 1;
+    }
+
+    function handleMessage(event: MessageEvent<string>): void {
+      refreshStallTimer();
+      const payload = safeParseJson(event.data);
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+
+      if ("error" in payload && payload.error) {
+        finish(new Error(`WebSocket RPC error: ${JSON.stringify(payload.error)}`));
+        return;
+      }
+
+      if ("result" in payload && typeof payload.result === "string" && subscriptionId === undefined) {
+        subscriptionId = payload.result;
+        logger.info("WebSocket newHeads subscription confirmed.", {
+          subscriptionId,
+          targetBlock: targetBlock.toString(),
+        });
+        return;
+      }
+
+      if (
+        "method" in payload &&
+        payload.method === "eth_subscription" &&
+        "params" in payload &&
+        payload.params &&
+        typeof payload.params === "object"
+      ) {
+        const params = payload.params as {
+          subscription?: unknown;
+          result?: {
+            number?: unknown;
+          };
+        };
+
+        if (subscriptionId && params.subscription !== subscriptionId) {
+          return;
+        }
+
+        const blockNumber = parseHexBlockNumber(params.result?.number);
+        if (blockNumber === null) {
+          return;
+        }
+
+        if (blockNumber >= targetBlock) {
+          logger.success(`Block trigger reached by WebSocket at block ${blockNumber.toString()}.`);
+          finish();
+        }
+      }
+    }
+
+    function handleError(event: Event): void {
+      const message = "error" in event && typeof event.error === "object" && event.error
+        ? String(event.error)
+        : "WebSocket transport error.";
+      finish(new Error(message));
+    }
+
+    function handleClose(event: CloseEvent): void {
+      if (socketClosedByBot) {
+        return;
+      }
+
+      finish(new Error(`WebSocket closed before target block. code=${event.code} reason=${event.reason || "unknown"}`));
+    }
+
+    socket = new WebSocketCtor(webSocketUrl);
+    socket.addEventListener("open", handleOpen);
+    socket.addEventListener("message", handleMessage);
+    socket.addEventListener("error", handleError);
+    socket.addEventListener("close", handleClose);
+
+    openTimer = setTimeout(() => {
+      finish(createTimeoutError("Timed out waiting for WebSocket connection."));
+    }, Math.max(3_000, Math.min(stallTimeoutMs, 10_000)));
+  });
+}
+
 export async function waitForTrigger(
   target: TargetConfig,
-  client: PublicClient,
+  client: RpcReadClient,
   calibration?: ClockCalibration,
 ): Promise<void> {
   const trigger = target.trigger;
@@ -223,16 +470,39 @@ export async function waitForTrigger(
 
   if (trigger.mode === "block") {
     const poll = trigger.pollIntervalMs ?? 500;
-
-    while (true) {
-      const current = await client.getBlockNumber();
-      if (current >= BigInt(trigger.blockNumber)) {
-        logger.success(`Block trigger reached at block ${current.toString()}.`);
-        return;
-      }
-
-      await sleep(poll);
+    const targetBlock = BigInt(trigger.blockNumber);
+    const current = await client.getBlockNumber();
+    if (current >= targetBlock) {
+      logger.success(`Block trigger already satisfied at block ${current.toString()}.`);
+      return;
     }
+
+    if (target.chain.rpc.webSocket) {
+      const stallTimeoutMs = Math.max(15_000, poll * 40);
+      logger.info("Waiting for block trigger via WebSocket newHeads.", {
+        currentBlock: current.toString(),
+        targetBlock: targetBlock.toString(),
+        webSocket: target.chain.rpc.webSocket,
+        stallTimeoutMs,
+      });
+
+      try {
+        await waitForBlockTriggerByWebSocket(target.chain.rpc.webSocket, targetBlock, stallTimeoutMs);
+        return;
+      } catch (error) {
+        logger.warn("WebSocket block trigger failed. Falling back to polling.", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    logger.info("Waiting for block trigger via polling fallback.", {
+      currentBlock: current.toString(),
+      targetBlock: targetBlock.toString(),
+      pollIntervalMs: poll,
+    });
+    await waitForBlockTriggerByPolling(client, targetBlock, poll);
+    return;
   }
 
   const poll = trigger.pollIntervalMs ?? 300;

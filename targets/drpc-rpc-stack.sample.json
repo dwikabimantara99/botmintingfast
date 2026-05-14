@@ -8,7 +8,7 @@
       "decimals": 18
     },
     "rpc": {
-      "primaryHttp": "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
+      "primaryHttp": "https://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI",
       "readHttp": [
         "https://rpc.ankr.com/eth/84fffbd4c54725874c4fc3a7deed918d54cc35d0ed5de3e5d7ab154c5edc7995",
         "https://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI",
@@ -21,7 +21,7 @@
         "https://rpc.ankr.com/eth/84fffbd4c54725874c4fc3a7deed918d54cc35d0ed5de3e5d7ab154c5edc7995",
         "https://mainnet.infura.io/v3/0605052cd8e24bcf839ff7efb694a850"
       ],
-      "webSocket": "wss://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
+      "webSocket": "wss://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI"
     }
   },
   "trigger": {
