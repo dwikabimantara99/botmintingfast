@@ -1,0 +1,63 @@
+{
+  "chain": {
+    "id": 1,
+    "name": "Ethereum",
+    "nativeCurrency": {
+      "name": "Ether",
+      "symbol": "ETH",
+      "decimals": 18
+    },
+    "rpc": {
+      "primaryHttp": "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
+      "broadcastHttp": [
+        "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
+      ],
+      "webSocket": "wss://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
+    }
+  },
+  "trigger": {
+    "mode": "time",
+    "startTimeIso": "2026-05-14T15:00:00.000Z",
+    "pollIntervalMs": 200,
+    "armBeforeMs": 4000,
+    "countdownIntervalMs": 15000,
+    "finalSpinWindowMs": 125
+  },
+  "transaction": {
+    "kind": "contractWrite",
+    "to": "0x1111111111111111111111111111111111111111",
+    "abi": [
+      "function mint(uint256 quantity) payable"
+    ],
+    "functionName": "mint",
+    "args": [
+      1
+    ],
+    "valueEth": "0.0008",
+    "gasLimit": 220000
+  },
+  "fees": {
+    "type": "budgetAggressive",
+    "targetUsd": 2.5,
+    "assumedNativePriceUsd": 2500,
+    "minFeeFloorGwei": 0.8,
+    "maxFeeCapGwei": 40,
+    "priorityFeeGwei": 0.08,
+    "profileMultipliers": [
+      1.2,
+      1.12,
+      1.05,
+      1.0,
+      0.96
+    ]
+  },
+  "execution": {
+    "walletCount": 1,
+    "replaceAfterMs": 4000,
+    "replaceMultiplier": 1.125,
+    "maxReplacementRounds": 3,
+    "receiptTimeoutMs": 90000,
+    "warmupRounds": 1,
+    "warmupDelayMs": 100
+  }
+}

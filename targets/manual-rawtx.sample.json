@@ -1,0 +1,48 @@
+{
+  "chain": {
+    "id": 1,
+    "name": "Ethereum",
+    "nativeCurrency": {
+      "name": "Ether",
+      "symbol": "ETH",
+      "decimals": 18
+    },
+    "rpc": {
+      "primaryHttp": "https://your-primary-rpc.example",
+      "broadcastHttp": [
+        "https://your-primary-rpc.example",
+        "https://your-backup-rpc-1.example",
+        "https://your-backup-rpc-2.example"
+      ],
+      "webSocket": "wss://your-primary-rpc.example/ws"
+    }
+  },
+  "trigger": {
+    "mode": "manual"
+  },
+  "transaction": {
+    "kind": "rawTransaction",
+    "to": "0x2222222222222222222222222222222222222222",
+    "data": "0x12345678",
+    "valueEth": "0.05",
+    "gasLimit": 350000
+  },
+  "fees": {
+    "type": "auto",
+    "maxFeeMultiplier": 2,
+    "profileMultipliers": [
+      1.7,
+      1.45,
+      1.3,
+      1.15,
+      1.0
+    ]
+  },
+  "execution": {
+    "walletCount": 5,
+    "replaceAfterMs": 3000,
+    "replaceMultiplier": 1.15,
+    "maxReplacementRounds": 4,
+    "receiptTimeoutMs": 120000
+  }
+}

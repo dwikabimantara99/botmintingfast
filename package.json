@@ -1,0 +1,25 @@
+{
+  "name": "halo-mint-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Adaptive high-speed EVM NFT mint bot for competition scenarios.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "bot": "tsx src/index.ts",
+    "validate": "tsx src/index.ts validate --target ./targets/manual-contract.sample.json",
+    "rehearse": "tsx src/index.ts rehearse --target ./targets/manual-contract.sample.json",
+    "status": "tsx src/index.ts status --target ./targets/manual-contract.sample.json",
+    "standby": "tsx src/index.ts standby --target ./targets/manual-contract.sample.json",
+    "fire": "tsx src/index.ts fire --target ./targets/manual-contract.sample.json"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "viem": "^2.39.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
