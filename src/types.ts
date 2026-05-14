@@ -41,6 +41,16 @@ export type TransactionConfig =
       accessList?: AccessList;
     }
   | {
+      kind: "omnihubCollectionMint";
+      to: Hex;
+      quantity: number;
+      referralAddress?: Hex;
+      preferredPhaseId?: number;
+      merkleProof?: Hex[];
+      gasLimit?: number;
+      accessList?: AccessList;
+    }
+  | {
       kind: "rawTransaction";
       to: Hex;
       data: Hex;
@@ -51,6 +61,7 @@ export type TransactionConfig =
 
 export type FeesConfig = {
   type: "auto" | "eip1559" | "legacy" | "budgetAggressive";
+  preset?: "safe" | "race" | "allOut";
   maxFeeMultiplier?: number;
   priorityFeeGwei?: number;
   maxFeeGwei?: number;
@@ -70,6 +81,23 @@ export type ExecutionConfig = {
   receiptTimeoutMs?: number;
   warmupRounds?: number;
   warmupDelayMs?: number;
+  minHealthyBroadcastRpc?: number;
+  minHealthyReadRpc?: number;
+  allowRiskyStandby?: boolean;
+  rpcOperationRetries?: number;
+  rpcOperationRetryDelayMs?: number;
+  rpcRecoveryPasses?: number;
+  rpcRecoveryDelayMs?: number;
+  rpcEndpointCooldownMs?: number;
+};
+
+export type VerificationConfig = {
+  contract?: Hex;
+  abi: Abi;
+  functionName: string;
+  args?: unknown[];
+  operator: "eq" | "gte" | "truthy";
+  expected?: unknown;
 };
 
 export type TargetConfig = {
@@ -92,6 +120,7 @@ export type TargetConfig = {
   transaction: TransactionConfig;
   fees: FeesConfig;
   execution?: ExecutionConfig;
+  verification?: VerificationConfig;
 };
 
 export type WalletProfile = {

@@ -1,10 +1,14 @@
 import {
   createWalletClient,
+  decodeFunctionResult,
   defineChain,
+  encodeFunctionData,
   formatEther,
   http,
   keccak256,
+  parseAbi,
   parseGwei,
+  type Abi,
   type AccessList,
   type Account,
   type Hex,
@@ -21,7 +25,7 @@ import type { TargetConfig, WalletProfile } from "../types.js";
 import { buildTransactionPayload } from "./adapter.js";
 import { broadcastSignedTransaction, pingEndpoint, probeEndpoint, rankHealthyEndpoints } from "./broadcast.js";
 import { calibrateClock, type ClockCalibration } from "./clock.js";
-import { createRpcMesh, type RpcReadClient } from "./rpcMesh.js";
+import { createRpcMesh, isRetryableReadError, type RpcReadClient } from "./rpcMesh.js";
 import {
   getTimeTriggerConfig,
   logClockStatusWithCalibration,
@@ -82,6 +86,11 @@ type ReceiptOutcome =
 
 type PreparedLadders = Map<number, PreparedSend[]>;
 
+type ValidationReport = {
+  results: ValidationItem[];
+  readiness: "READY" | "RISKY" | "BLOCKED";
+};
+
 type LiveFeeMarket = {
   currentGasPrice: bigint;
   currentBaseFeePerGas?: bigint;
@@ -89,6 +98,33 @@ type LiveFeeMarket = {
   suggestedPriorityFeePerGas: bigint;
   suggestedMaxFeePerGas: bigint;
 };
+
+type VerificationResult = {
+  ok: boolean;
+  details: string;
+  value?: unknown;
+};
+
+const feePresetDefaults = {
+  safe: {
+    targetUsd: 1.5,
+    minFeeFloorGwei: 0.5,
+    maxFeeCapGwei: 25,
+    priorityFeeGwei: 0.05,
+  },
+  race: {
+    targetUsd: 2.5,
+    minFeeFloorGwei: 0.8,
+    maxFeeCapGwei: 40,
+    priorityFeeGwei: 0.08,
+  },
+  allOut: {
+    targetUsd: 4,
+    minFeeFloorGwei: 1.25,
+    maxFeeCapGwei: 80,
+    priorityFeeGwei: 0.12,
+  },
+} as const;
 
 function buildChain(target: TargetConfig) {
   return defineChain({
@@ -102,6 +138,18 @@ function buildChain(target: TargetConfig) {
       },
     },
   });
+}
+
+function normalizeAbi(abi: Abi | readonly string[]): Abi {
+  if (abi.length === 0) {
+    return abi as Abi;
+  }
+
+  if (typeof abi[0] === "string") {
+    return parseAbi(abi as readonly string[]);
+  }
+
+  return abi as Abi;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -125,6 +173,99 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
+function replacePlaceholders(value: unknown, walletAddress: Hex, walletIndex: number): unknown {
+  if (typeof value === "string") {
+    if (value === "__WALLET__") return walletAddress;
+    if (value === "__INDEX__") return walletIndex;
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => replacePlaceholders(item, walletAddress, walletIndex));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, nested]) => [
+        key,
+        replacePlaceholders(nested, walletAddress, walletIndex),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function formatVerificationValue(value: unknown): string {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (Array.isArray(value) || typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function compareVerificationValue(actual: unknown, operator: "eq" | "gte" | "truthy", expected?: unknown): boolean {
+  if (operator === "truthy") {
+    return Boolean(actual);
+  }
+
+  if (operator === "eq") {
+    if (typeof actual === "bigint" || typeof expected === "bigint") {
+      return BigInt(actual as bigint | number | string) === BigInt(expected as bigint | number | string);
+    }
+
+    return actual === expected;
+  }
+
+  if (typeof actual === "bigint" || typeof expected === "bigint") {
+    return BigInt(actual as bigint | number | string) >= BigInt(expected as bigint | number | string);
+  }
+
+  return Number(actual) >= Number(expected);
+}
+
+async function runPostMintVerification(
+  target: TargetConfig,
+  client: RpcReadClient,
+  account: Account,
+  profile: WalletProfile,
+): Promise<VerificationResult | null> {
+  if (!target.verification) {
+    return null;
+  }
+
+  const args = (target.verification.args ?? []).map((arg) =>
+    replacePlaceholders(arg, account.address, profile.index),
+  );
+  const contract = target.verification.contract ?? target.transaction.to;
+  const abi = normalizeAbi(target.verification.abi);
+  const data = encodeFunctionData({
+    abi,
+    functionName: target.verification.functionName,
+    args,
+  });
+  const raw = await client.call({
+    to: contract,
+    data,
+  });
+  const decoded = decodeFunctionResult({
+    abi,
+    functionName: target.verification.functionName,
+    data: raw.data ?? "0x",
+  });
+  const ok = compareVerificationValue(decoded, target.verification.operator, target.verification.expected);
+
+  return {
+    ok,
+    value: decoded,
+    details:
+      target.verification.operator === "truthy"
+        ? `verification=${formatVerificationValue(decoded)}`
+        : `actual=${formatVerificationValue(decoded)}, expected=${formatVerificationValue(target.verification.expected)}`,
+  };
+}
+
 function pushValidation(
   results: ValidationItem[],
   check: string,
@@ -145,6 +286,48 @@ function summarizeReadiness(results: ValidationItem[]): "READY" | "RISKY" | "BLO
   }
 
   return "READY";
+}
+
+function isRetryableRpcOperationError(error: unknown): boolean {
+  return isRetryableReadError(error);
+}
+
+async function withRpcOperationRetries<T>(
+  target: TargetConfig,
+  label: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const maxAttempts = Math.max(1, target.execution?.rpcOperationRetries ?? 2);
+  const retryDelayMs = Math.max(100, target.execution?.rpcOperationRetryDelayMs ?? 1200);
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableRpcOperationError(error) || attempt === maxAttempts) {
+        throw error;
+      }
+
+      logger.warn(`${label} hit a retryable RPC failure. Retrying.`, {
+        attempt,
+        maxAttempts,
+        retryDelayMs: retryDelayMs * attempt,
+        error: describeError(error),
+      });
+      emitTelemetrySafe("rpc_operation_retry", {
+        label,
+        attempt,
+        maxAttempts,
+        retryDelayMs: retryDelayMs * attempt,
+        error: describeError(error),
+      });
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+
+  throw lastError;
 }
 
 function buildUnsignedRequest(
@@ -271,20 +454,21 @@ async function resolveFeeEnvelope(
 ): Promise<FeeEnvelope> {
   const latestBlock = await client.getBlock();
   const fees = target.fees;
+  const presetDefaults = fees.preset ? feePresetDefaults[fees.preset] : undefined;
   const replacementMultiplier =
     replacementRound > 0 ? Math.pow(target.execution?.replaceMultiplier ?? 1.125, replacementRound) : 1;
   const walletMultiplier = profile.multiplier;
   const totalMultiplier = walletMultiplier * replacementMultiplier;
 
   if (fees.type === "budgetAggressive") {
-    const targetUsd = fees.targetUsd ?? 2.5;
+    const targetUsd = fees.targetUsd ?? presetDefaults?.targetUsd ?? 2.5;
     const assumedNativePriceUsd = fees.assumedNativePriceUsd;
     if (!assumedNativePriceUsd || assumedNativePriceUsd <= 0) {
       throw new Error("fees.assumedNativePriceUsd is required for budgetAggressive mode.");
     }
 
     const targetGasPriceGwei = (targetUsd / assumedNativePriceUsd) * 1_000_000_000 / Number(gasLimit);
-    const floorGwei = fees.minFeeFloorGwei ?? 0.5;
+    const floorGwei = fees.minFeeFloorGwei ?? presetDefaults?.minFeeFloorGwei ?? 0.5;
     const baseTargetGwei = Math.max(targetGasPriceGwei, floorGwei);
     const adjustedBudgetGwei = baseTargetGwei * totalMultiplier;
     const liveCompetitiveMaxFee = scaleBigInt(
@@ -294,14 +478,15 @@ async function resolveFeeEnvelope(
     const budgetMaxFee = parseGwei(adjustedBudgetGwei.toFixed(9));
     let maxFeePerGas = maxBigInt(budgetMaxFee, liveCompetitiveMaxFee);
 
-    if (fees.maxFeeCapGwei !== undefined) {
-      const explicitCap = parseGwei(String(fees.maxFeeCapGwei));
+    const maxFeeCapGwei = fees.maxFeeCapGwei ?? presetDefaults?.maxFeeCapGwei;
+    if (maxFeeCapGwei !== undefined) {
+      const explicitCap = parseGwei(String(maxFeeCapGwei));
       maxFeePerGas = maxFeePerGas > explicitCap ? explicitCap : maxFeePerGas;
     }
 
     const priorityFeeBase =
-      fees.priorityFeeGwei !== undefined
-        ? parseGwei(String(fees.priorityFeeGwei))
+      fees.priorityFeeGwei !== undefined || presetDefaults?.priorityFeeGwei !== undefined
+        ? parseGwei(String(fees.priorityFeeGwei ?? presetDefaults?.priorityFeeGwei))
         : maxBigInt(liveFeeMarket?.suggestedPriorityFeePerGas ?? 0n, parseGwei("0.05"));
     const scaledPriorityFee = scaleBigInt(scaleBigInt(priorityFeeBase, walletMultiplier), replacementMultiplier);
 
@@ -365,7 +550,7 @@ async function createPreparedSend(
     transport: http(target.chain.rpc.primaryHttp),
   });
 
-  const payload = buildTransactionPayload(target, account.address, profile.index);
+  const payload = await buildTransactionPayload(client, target, account.address, profile.index);
   const nonce =
     nonceOverride ??
     (await client.getTransactionCount({
@@ -511,7 +696,7 @@ async function waitForReceiptOutcome(
   };
 }
 
-export async function runStatus(target: TargetConfig): Promise<void> {
+async function runStatusCore(target: TargetConfig): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
   const client = createRpcMesh(target);
   await client.refreshRanking();
@@ -544,11 +729,26 @@ export async function runStatus(target: TargetConfig): Promise<void> {
   });
 }
 
-export async function runValidate(target: TargetConfig): Promise<void> {
-  const accounts = loadAccounts(target.execution?.walletCount ?? 5);
-  const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
-  const client = createRpcMesh(target);
-  await client.refreshRanking();
+async function logLightRuntimeContext(
+  target: TargetConfig,
+  client: RpcReadClient,
+  accounts: Account[],
+): Promise<void> {
+  const block = await client.getBlockNumber();
+  logger.info("Runtime context.", {
+    chain: target.chain.name,
+    block: block.toString(),
+    walletCount: accounts.length,
+    addresses: accounts.map((account) => account.address),
+  });
+}
+
+async function collectValidationReport(
+  target: TargetConfig,
+  client: RpcReadClient,
+  accounts: Account[],
+  profiles: WalletProfile[],
+): Promise<ValidationReport> {
   const results: ValidationItem[] = [];
 
   const chainId = await client.getChainId();
@@ -561,11 +761,32 @@ export async function runValidate(target: TargetConfig): Promise<void> {
 
   const endpointHealth = await Promise.all(target.chain.rpc.broadcastHttp.map((endpoint) => pingEndpoint(endpoint)));
   const healthyEndpoints = endpointHealth.filter((item) => item.ok).length;
+  const requiredHealthyBroadcastRpc = Math.min(
+    endpointHealth.length,
+    Math.max(1, target.execution?.minHealthyBroadcastRpc ?? (endpointHealth.length > 1 ? 2 : 1)),
+  );
   pushValidation(
     results,
     "Broadcast RPCs",
-    healthyEndpoints > 0,
-    `${healthyEndpoints}/${endpointHealth.length} endpoints responded successfully`,
+    healthyEndpoints >= requiredHealthyBroadcastRpc,
+    `${healthyEndpoints}/${endpointHealth.length} endpoints responded successfully (required ${requiredHealthyBroadcastRpc})`,
+  );
+
+  const readProbeEndpoints = Array.from(
+    new Set([target.chain.rpc.primaryHttp, ...(target.chain.rpc.readHttp ?? [])]),
+  );
+  const readEndpointHealth = await Promise.all(readProbeEndpoints.map((endpoint) => pingEndpoint(endpoint)));
+  const healthyReadEndpoints = readEndpointHealth.filter((item) => item.ok).length;
+  const requiredHealthyReadRpc = Math.min(
+    readProbeEndpoints.length,
+    Math.max(1, target.execution?.minHealthyReadRpc ?? Math.min(2, readProbeEndpoints.length)),
+  );
+  pushValidation(
+    results,
+    "Read RPCs",
+    healthyReadEndpoints >= requiredHealthyReadRpc,
+    `${healthyReadEndpoints}/${readProbeEndpoints.length} read endpoints responded successfully (required ${requiredHealthyReadRpc})`,
+    "risk",
   );
 
   if (target.trigger.mode === "time") {
@@ -669,7 +890,7 @@ export async function runValidate(target: TargetConfig): Promise<void> {
 
   const sampleAccount = accounts[0]!;
   const sampleProfile = profiles[0]!;
-  const payload = buildTransactionPayload(target, sampleAccount.address, sampleProfile.index);
+  const payload = await buildTransactionPayload(client, target, sampleAccount.address, sampleProfile.index);
   const gasLimit = payload.gas;
 
   const contractBytecode = await client.getBytecode({ address: payload.to });
@@ -793,19 +1014,41 @@ export async function runValidate(target: TargetConfig): Promise<void> {
     );
   }
 
-  const readiness = summarizeReadiness(results);
-  logger.info("Preflight validation summary.", {
-    readiness,
-    telemetryPath: getTelemetryPath(),
+  return {
     results,
+    readiness: summarizeReadiness(results),
+  };
+}
+
+function logValidationReport(report: ValidationReport): void {
+  logger.info("Preflight validation summary.", {
+    readiness: report.readiness,
+    telemetryPath: getTelemetryPath(),
+    results: report.results,
+  });
+}
+
+export async function runStatus(target: TargetConfig): Promise<void> {
+  await withRpcOperationRetries(target, "Status", () => runStatusCore(target));
+}
+
+export async function runValidate(target: TargetConfig): Promise<void> {
+  const report = await withRpcOperationRetries(target, "Validate", async () => {
+    const accounts = loadAccounts(target.execution?.walletCount ?? 5);
+    const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
+    const client = createRpcMesh(target);
+    await client.refreshRanking();
+    return collectValidationReport(target, client, accounts, profiles);
   });
 
-  if (readiness === "READY") {
+  logValidationReport(report);
+
+  if (report.readiness === "READY") {
     logger.success("Validation passed. Bot is ready for armed standby.");
     return;
   }
 
-  if (readiness === "RISKY") {
+  if (report.readiness === "RISKY") {
     logger.warn("Validation is risky. The bot can run, but you should fix the warnings before the competition.");
     return;
   }
@@ -817,21 +1060,38 @@ export async function runStandby(target: TargetConfig): Promise<void> {
   const accounts = loadAccounts(target.execution?.walletCount ?? 5);
   const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
   const client = createRpcMesh(target);
-  await client.refreshRanking();
+  await withRpcOperationRetries(target, "Standby RPC ranking", () => client.refreshRanking());
+  const preflightReport = await withRpcOperationRetries(target, "Standby safety gate", () =>
+    collectValidationReport(target, client, accounts, profiles),
+  );
+  logValidationReport(preflightReport);
+  if (preflightReport.readiness === "BLOCKED") {
+    throw new Error("Standby safety gate is BLOCKED. Refusing to arm until the blocking issues are fixed.");
+  }
+
+  if (preflightReport.readiness === "RISKY" && !target.execution?.allowRiskyStandby) {
+    throw new Error(
+      "Standby safety gate is RISKY. Set execution.allowRiskyStandby=true only if you intentionally accept the warnings.",
+    );
+  }
+
   const clockCalibration = await calibrateClock([
     target.chain.rpc.primaryHttp,
     ...target.chain.rpc.broadcastHttp,
     ...(target.chain.rpc.readHttp ?? []),
   ]);
 
-  await runStatus(target);
+  logger.info("Standby safety gate passed. Bot can arm when the trigger is ready.", {
+    readiness: preflightReport.readiness,
+    failedChecks: preflightReport.results.filter((item) => !item.ok),
+  });
   const timeSchedule = getTimeTriggerConfig(target);
 
   if (timeSchedule) {
     const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
     logger.info("Timed standby active. Bot will arm before mint opens.");
     await waitForArmWindow(target, clockCalibration);
-    await client.refreshRanking();
+    await withRpcOperationRetries(target, "Standby arm RPC ranking", () => client.refreshRanking());
     const refreshedClockCalibration = await calibrateClock([
       target.chain.rpc.primaryHttp,
       ...target.chain.rpc.broadcastHttp,
@@ -843,7 +1103,9 @@ export async function runStandby(target: TargetConfig): Promise<void> {
       refreshedClockOffsetMs: refreshedClockCalibration.offsetMs,
     });
     const rankedEndpoints = await warmBroadcastEndpoints(target);
-    let ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
+    let ladders = await withRpcOperationRetries(target, "Standby ladder build", () =>
+      buildPreparedLadders(client, target, accounts, profiles, replacementRounds),
+    );
     let fireCalibration = refreshedClockCalibration;
 
     if (timeSchedule.repriceAtMs !== null) {
@@ -861,7 +1123,7 @@ export async function runStandby(target: TargetConfig): Promise<void> {
           fireCalibration,
           true,
         );
-        await client.refreshRanking();
+        await withRpcOperationRetries(target, "Standby final reprice ranking", () => client.refreshRanking());
         const finalRepriceCalibration = await calibrateClock([
           target.chain.rpc.primaryHttp,
           ...target.chain.rpc.broadcastHttp,
@@ -870,7 +1132,9 @@ export async function runStandby(target: TargetConfig): Promise<void> {
 
         try {
           logger.info("Refreshing live fee market and re-signing ladder close to mint open.");
-          ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
+          ladders = await withRpcOperationRetries(target, "Standby final reprice", () =>
+            buildPreparedLadders(client, target, accounts, profiles, replacementRounds),
+          );
           fireCalibration = finalRepriceCalibration;
           emitTelemetrySafe("timed_reprice_success", {
             repriceBeforeMs: timeSchedule.repriceBeforeMs,
@@ -907,31 +1171,33 @@ export async function runStandby(target: TargetConfig): Promise<void> {
 }
 
 export async function runRehearse(target: TargetConfig): Promise<void> {
-  const accounts = loadAccounts(target.execution?.walletCount ?? 5);
-  const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
-  const client = createRpcMesh(target);
-  await client.refreshRanking();
-  const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
+  await withRpcOperationRetries(target, "Rehearsal", async () => {
+    const accounts = loadAccounts(target.execution?.walletCount ?? 5);
+    const profiles = getWalletProfiles(accounts.length, target.fees.profileMultipliers);
+    const client = createRpcMesh(target);
+    await client.refreshRanking();
+    const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
 
-  await runStatus(target);
-  logger.info("Preparing rehearsal ladder without broadcasting.");
-  const ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
-  const rankedEndpoints = await warmBroadcastEndpoints(target);
+    await logLightRuntimeContext(target, client, accounts);
+    logger.info("Preparing rehearsal ladder without broadcasting.");
+    const ladders = await buildPreparedLadders(client, target, accounts, profiles, replacementRounds);
+    const rankedEndpoints = await warmBroadcastEndpoints(target);
 
-  const summary = Array.from(ladders.values()).map((ladder) => ({
-    wallet: ladder[0]!.account.address,
-    nonce: ladder[0]!.nonce,
-    rounds: ladder.map((send, index) => ({
-      round: index + 1,
-      profile: send.profile.label,
-      hash: send.transactionHash,
-    })),
-  }));
+    const summary = Array.from(ladders.values()).map((ladder) => ({
+      wallet: ladder[0]!.account.address,
+      nonce: ladder[0]!.nonce,
+      rounds: ladder.map((send, index) => ({
+        round: index + 1,
+        profile: send.profile.label,
+        hash: send.transactionHash,
+      })),
+    }));
 
-  logger.success("Rehearsal complete. Fire path can pre-sign all rounds.", summary);
-  emitTelemetrySafe("rehearsal_complete", {
-    rankedEndpoints,
-    summary,
+    logger.success("Rehearsal complete. Fire path can pre-sign all rounds.", summary);
+    emitTelemetrySafe("rehearsal_complete", {
+      rankedEndpoints,
+      summary,
+    });
   });
 }
 
@@ -1009,12 +1275,25 @@ async function executePreparedRounds(
     }
 
     if (confirmedSuccess.length > 0) {
+      const verificationResults = await Promise.all(
+        confirmedSuccess.map(async (item) => ({
+          wallet: item.send.account.address,
+          profile: item.send.profile.label,
+          verification: await runPostMintVerification(target, client, item.send.account, item.send.profile).catch(
+            (error) => ({
+              ok: false,
+              details: describeError(error),
+            }),
+          ),
+        })),
+      );
       logger.success("At least one wallet confirmed successfully.", {
         confirmedWallets: confirmedSuccess.map((item) => ({
           wallet: item.send.account.address,
           profile: item.send.profile.label,
           hash: item.outcome.hash,
         })),
+        verificationResults,
         revertedWallets: reverted.map((item) => ({
           wallet: item.send.account.address,
           profile: item.send.profile.label,
@@ -1027,6 +1306,7 @@ async function executePreparedRounds(
           profile: item.send.profile.label,
           hash: item.outcome.hash,
         })),
+        verificationResults,
         revertedWallets: reverted.map((item) => ({
           wallet: item.send.account.address,
           profile: item.send.profile.label,
@@ -1087,6 +1367,40 @@ async function executePreparedRounds(
       outcome: terminalStates.get(walletIndex) ?? (await waitForReceiptOutcome(client, hash, receiptTimeout)),
     })),
   );
+
+  const lateSuccess = finalChecks.filter((item) => item.outcome.status === "success");
+  if (lateSuccess.length > 0) {
+    const lateVerificationResults = await Promise.all(
+      lateSuccess.map(async (item) => {
+        const matched = prepared.find((send) => send.profile.index === item.walletIndex);
+        if (!matched) {
+          return {
+            walletIndex: item.walletIndex,
+            verification: null,
+          };
+        }
+
+        return {
+          walletIndex: item.walletIndex,
+          verification: await runPostMintVerification(target, client, matched.account, matched.profile).catch(
+            (error) => ({
+              ok: false,
+              details: describeError(error),
+            }),
+          ),
+        };
+      }),
+    );
+    logger.success("Fire sequence confirmed successfully after the early confirmation window.", {
+      finalChecks,
+      verificationResults: lateVerificationResults,
+    });
+    emitTelemetrySafe("fire_confirmed_late", {
+      finalChecks,
+      verificationResults: lateVerificationResults,
+    });
+    return;
+  }
 
   logger.warn("Fire sequence finished without an early confirmation.", finalChecks);
   logger.info("If receipts are still pending, check explorer or rerun with a more aggressive fee config.");

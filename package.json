@@ -7,14 +7,20 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "bot": "tsx src/index.ts",
+    "bot:custom": "tsx src/index.ts",
     "validate": "tsx src/index.ts validate --target ./targets/manual-contract.sample.json",
     "rehearse": "tsx src/index.ts rehearse --target ./targets/manual-contract.sample.json",
     "status": "tsx src/index.ts status --target ./targets/manual-contract.sample.json",
     "standby": "tsx src/index.ts standby --target ./targets/manual-contract.sample.json",
-    "fire": "tsx src/index.ts fire --target ./targets/manual-contract.sample.json"
+    "fire": "tsx src/index.ts fire --target ./targets/manual-contract.sample.json",
+    "sepolia:deploy": "tsx src/sepolia/deployTestMint.ts --target ./targets/sepolia-race.sample.json --output ./targets/sepolia-race.generated.json",
+    "smoke:trigger": "tsx src/smoke/triggerSmoke.ts ./targets/alchemy-rpc-stack.sample.json",
+    "smoke:rpc": "tsx src/smoke/rpcStackCompare.ts ./targets/alchemy-rpc-stack.sample.json ./targets/drpc-rpc-stack.sample.json",
+    "battle:test": "tsx src/smoke/battleTest.ts ./targets/alchemy-rpc-stack.sample.json"
   },
   "dependencies": {
     "dotenv": "^16.6.1",
+    "solc": "^0.8.35",
     "viem": "^2.39.0"
   },
   "devDependencies": {

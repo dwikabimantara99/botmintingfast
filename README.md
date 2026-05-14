@@ -1,112 +1,187 @@
 # Halo Mint Bot
 
-Adaptive EVM NFT mint bot for FCFS competition scenarios.
+High-speed EVM mint bot for FCFS scenarios.
 
-## What it does
+## Fokus Bot
 
-- Loads up to 5 competition wallets from `.env`
-- Connects to one primary RPC and multiple broadcast RPC endpoints
-- Can use optional dedicated `readHttp` endpoints for nonce, simulation, and chain reads
-- Waits in `standby` mode until a trigger is active
-- Arms a timed mint a few seconds early, then fires on the exact target clock
-- Signs locally and broadcasts the same raw transaction to many RPCs in parallel
-- Uses different fee profiles per wallet
-- Replaces pending transactions with higher fees automatically
-- Pre-signs a replacement ladder before mint opens when using timed standby
+Bot ini dibangun untuk alur inti berikut:
 
-## Core commands
+1. load wallet EVM dari `.env`
+2. load target mint dari `targets/*.json`
+3. `validate`
+4. `rehearse`
+5. `standby` atau `fire`
+6. sign lokal
+7. broadcast ke banyak RPC
+8. replace tx kalau pending
+9. tunggu konfirmasi
+
+Bot ini adalah `execution bot`, bukan crawler website umum.
+
+## Struktur Penting
+
+- [src/index.ts](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/src/index.ts)
+- [src/mint/engine.ts](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/src/mint/engine.ts)
+- [src/mint/adapter.ts](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/src/mint/adapter.ts)
+- [src/mint/broadcast.ts](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/src/mint/broadcast.ts)
+- [src/mint/rpcMesh.ts](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/src/mint/rpcMesh.ts)
+- [targets/manual-contract.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-contract.sample.json)
+- [targets/manual-rawtx.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-rawtx.sample.json)
+- [targets/local-race.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/local-race.sample.json)
+
+## Command Utama
 
 ```bash
-npm.cmd install
-npm.cmd run build
-npm.cmd run bot -- validate --target ./targets/manual-contract.sample.json
-npm.cmd run bot -- rehearse --target ./targets/manual-contract.sample.json
-npm.cmd run bot -- status --target ./targets/manual-contract.sample.json
-npm.cmd run bot -- standby --target ./targets/manual-contract.sample.json
-npm.cmd run bot -- fire --target ./targets/manual-contract.sample.json
+npm install
+npm run build
+npm run bot -- status --target ./targets/local-race.sample.json
+npm run bot -- validate --target ./targets/local-race.sample.json
+npm run bot -- rehearse --target ./targets/local-race.sample.json
+npm run bot -- standby --target ./targets/local-race.sample.json
+npm run bot -- fire --target ./targets/local-race.sample.json
 ```
 
-## Files you will edit most often
+Kalau mau target lain:
 
-- `.env`
-- `targets/*.json`
+```bash
+npm run bot:custom -- fire --target ./targets/my-target.json
+```
 
-## Target modes
+## Mode Target
 
 ### `contractWrite`
 
-Use this when you know the contract address, ABI, function name, and arguments.
+Pakai ini kalau kamu tahu:
+
+- contract address
+- ABI
+- function name
+- args
+- value mint
 
 ### `rawTransaction`
 
-Use this when you already have the final calldata and only need the bot to sign and blast it fast.
+Pakai ini kalau kamu sudah punya:
 
-This mode is the universal fallback for unusual launchpads, proxy routers, and marketplace routes.
+- `to`
+- `data`
+- `value`
 
-## Competition fee mode
+Ini fallback paling universal untuk launchpad, router, atau marketplace route yang aneh.
 
-For a practical FCFS setup, use `budgetAggressive` and set:
+## Preset Fee Tempur
 
-- `targetUsd`: your per-wallet fee target such as `2.5`
-- `assumedNativePriceUsd`: your estimate of the gas token price
-- `minFeeFloorGwei`: minimum floor so the bot still shoots hard even if the USD math is too low
-- `maxFeeCapGwei`: optional ceiling so it does not overshoot your budget too much
+Untuk `budgetAggressive`, sekarang kamu bisa pakai preset:
 
-This is still an estimate. Real gas paid can be lower or higher depending on chain conditions.
+- `safe`
+- `race`
+- `allOut`
 
-## Trigger modes
+Preset ini hanya memberi default tempur. Kalau kamu isi angka manual seperti `targetUsd` atau `maxFeeCapGwei`, nilai manual tetap menang.
 
-- `manual`: use with the `fire` command
-- `time`: bot fires at an exact ISO timestamp
-- `block`: bot uses `newHeads` via WebSocket when available, then falls back to polling if needed
-- `read`: bot polls a contract read until the expected condition is true
+## Post-Mint Verification
 
-## RPC roles
+Target sekarang bisa punya blok `verification` opsional.
 
-- `primaryHttp`: default RPC for wallet prep and general reads
-- `readHttp`: optional extra read RPCs for chain reads, nonce, simulation, and fee sampling
-- `broadcastHttp`: endpoints used to blast signed raw transactions in parallel
-- `webSocket`: optional high-speed channel for block-trigger subscription
-
-## Time trigger tuning
-
-Inside the `time` trigger you can optionally set:
-
-- `armBeforeMs`: how early the bot prepares signed transactions before mint opens
-- `repriceBeforeMs`: how late the bot refreshes the live fee market and re-signs the ladder before mint opens
-- `countdownIntervalMs`: how often the bot prints countdown notices
-- `finalSpinWindowMs`: the final high-precision timing window before broadcast
-
-Recommended starting values:
+Contoh umum untuk ERC-721:
 
 ```json
-{
-  "mode": "time",
-  "startTimeIso": "2026-05-14T15:00:00.000Z",
-  "pollIntervalMs": 200,
-  "armBeforeMs": 4000,
-  "repriceBeforeMs": 900,
-  "countdownIntervalMs": 15000,
-  "finalSpinWindowMs": 125
+"verification": {
+  "abi": ["function balanceOf(address owner) view returns (uint256)"],
+  "functionName": "balanceOf",
+  "args": ["__WALLET__"],
+  "operator": "gte",
+  "expected": 1
 }
 ```
 
-`repriceBeforeMs` lets the bot rebuild the pre-signed replacement ladder very close to mint open using fresher gas data, while still keeping the final `fire` path short.
+Kalau receipt sukses, bot akan coba cek hasil mint itu lagi lewat contract read.
 
-## Rehearsal mode
+## Trigger
 
-Use `rehearse` to test the critical fire path without broadcasting live transactions.
+- `manual`
+- `time`
+- `block`
+- `read`
 
-It will:
+## RPC Roles
 
-- build the full pre-signed replacement ladder
-- warm up the broadcast RPC endpoints
-- print the signed transaction hashes for each round
+- `primaryHttp`: anchor default
+- `readHttp`: bacaan nonce, simulation, fee, receipt
+- `broadcastHttp`: jalur blast raw tx
+- `webSocket`: block/event detection cepat
 
-This is the safest operational test before the real event.
+## Workflow Operasional
+
+Urutan yang disarankan:
+
+1. isi `.env`
+2. isi target JSON
+3. jalankan `status`
+4. jalankan `validate`
+5. jalankan `rehearse`
+6. kalau sehat, jalankan `standby` atau `fire`
+
+## File `.env`
+
+Contoh minimum:
+
+```env
+PRIVATE_KEYS=0xPRIVATE_KEY_1,0xPRIVATE_KEY_2
+RPC_REQUEST_TIMEOUT_MS=3500
+RECEIPT_TIMEOUT_MS=120000
+```
+
+## Sample Target
+
+### Direct contract
+
+Mulai dari:
+
+- [targets/manual-contract.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-contract.sample.json)
+
+### Raw calldata
+
+Mulai dari:
+
+- [targets/manual-rawtx.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-rawtx.sample.json)
+
+### Local aggressive profile
+
+Mulai dari:
+
+- [targets/local-race.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/local-race.sample.json)
+
+## Test & Drill
+
+Build:
+
+```bash
+npm run build
+```
+
+Smoke:
+
+```bash
+npm run smoke:trigger
+npm run smoke:rpc
+npm run battle:test
+```
+
+Sepolia proof path:
+
+```bash
+npm run sepolia:deploy -- --openAtIso 2026-05-14T15:00:00.000Z
+```
+
+## Catatan
+
+- Bot ini sudah terbukti bisa mint di Sepolia test route.
+- Target pihak ketiga tetap perlu route yang benar.
+- Kemenangan lomba tetap dipengaruhi target, RPC, jaringan, dan timing.
 
 ## Safety
 
-- Use only the 5 wallets provided by the competition
-- Do not store your primary wallet here
-- Keep `.env` private
+- pakai wallet lomba, bukan wallet utama
+- jangan commit `.env`
+- jangan kirim private key ke chat

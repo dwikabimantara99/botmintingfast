@@ -12,14 +12,14 @@
       "readHttp": [
         "https://rpc.ankr.com/eth/84fffbd4c54725874c4fc3a7deed918d54cc35d0ed5de3e5d7ab154c5edc7995",
         "https://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI",
-        "https://mainnet.infura.io/v3/0605052cd8e24bcf839ff7efb694a850",
+        "https://ethereum-mainnet.core.chainstack.com/bb93999f25c7171092fccce64915c7c6",
         "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
       ],
       "broadcastHttp": [
         "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
         "https://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI",
         "https://rpc.ankr.com/eth/84fffbd4c54725874c4fc3a7deed918d54cc35d0ed5de3e5d7ab154c5edc7995",
-        "https://mainnet.infura.io/v3/0605052cd8e24bcf839ff7efb694a850"
+        "https://ethereum-mainnet.core.chainstack.com/bb93999f25c7171092fccce64915c7c6"
       ],
       "webSocket": "wss://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
     }
@@ -48,6 +48,7 @@
   },
   "fees": {
     "type": "budgetAggressive",
+    "preset": "race",
     "targetUsd": 2.5,
     "assumedNativePriceUsd": 2500,
     "minFeeFloorGwei": 0.8,
@@ -61,6 +62,17 @@
       0.96
     ]
   },
+  "verification": {
+    "abi": [
+      "function balanceOf(address owner) view returns (uint256)"
+    ],
+    "functionName": "balanceOf",
+    "args": [
+      "__WALLET__"
+    ],
+    "operator": "gte",
+    "expected": 1
+  },
   "execution": {
     "walletCount": 1,
     "replaceAfterMs": 4000,
@@ -68,6 +80,14 @@
     "maxReplacementRounds": 3,
     "receiptTimeoutMs": 90000,
     "warmupRounds": 1,
-    "warmupDelayMs": 100
+    "warmupDelayMs": 100,
+    "minHealthyBroadcastRpc": 2,
+    "minHealthyReadRpc": 2,
+    "allowRiskyStandby": false,
+    "rpcOperationRetries": 2,
+    "rpcOperationRetryDelayMs": 1200,
+    "rpcRecoveryPasses": 2,
+    "rpcRecoveryDelayMs": 250,
+    "rpcEndpointCooldownMs": 1500
   }
 }

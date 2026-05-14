@@ -1,0 +1,87 @@
+{
+  "chain": {
+    "id": 11155111,
+    "name": "Ethereum Sepolia",
+    "nativeCurrency": {
+      "name": "Sepolia Ether",
+      "symbol": "ETH",
+      "decimals": 18
+    },
+    "rpc": {
+      "primaryHttp": "https://eth-sepolia.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
+      "readHttp": [
+        "https://eth-sepolia.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
+      ],
+      "broadcastHttp": [
+        "https://eth-sepolia.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
+      ],
+      "webSocket": "wss://eth-sepolia.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
+    }
+  },
+  "trigger": {
+    "mode": "time",
+    "startTimeIso": "2026-05-14T15:00:00.000Z",
+    "pollIntervalMs": 150,
+    "armBeforeMs": 5000,
+    "repriceBeforeMs": 750,
+    "countdownIntervalMs": 30000,
+    "finalSpinWindowMs": 100
+  },
+  "transaction": {
+    "kind": "contractWrite",
+    "to": "0x1111111111111111111111111111111111111111",
+    "abi": [
+      "function mint(uint256 quantity) payable"
+    ],
+    "functionName": "mint",
+    "args": [
+      1
+    ],
+    "valueEth": "0.0001",
+    "gasLimit": 220000
+  },
+  "fees": {
+    "type": "budgetAggressive",
+    "preset": "safe",
+    "targetUsd": 0.25,
+    "assumedNativePriceUsd": 2500,
+    "minFeeFloorGwei": 0.05,
+    "maxFeeCapGwei": 10,
+    "priorityFeeGwei": 0.02,
+    "profileMultipliers": [
+      1.2,
+      1.12,
+      1.05,
+      1.0,
+      0.96
+    ]
+  },
+  "verification": {
+    "abi": [
+      "function balanceOf(address owner) view returns (uint256)"
+    ],
+    "functionName": "balanceOf",
+    "args": [
+      "__WALLET__"
+    ],
+    "operator": "gte",
+    "expected": 1
+  },
+  "execution": {
+    "walletCount": 1,
+    "replaceAfterMs": 2200,
+    "replaceMultiplier": 1.15,
+    "maxReplacementRounds": 3,
+    "receiptTimeoutMs": 90000,
+    "warmupRounds": 1,
+    "warmupDelayMs": 80,
+    "minHealthyBroadcastRpc": 1,
+    "minHealthyReadRpc": 1,
+    "allowRiskyStandby": false,
+    "rpcOperationRetries": 2,
+    "rpcOperationRetryDelayMs": 1200,
+    "rpcRecoveryPasses": 2,
+    "rpcRecoveryDelayMs": 250,
+    "rpcEndpointCooldownMs": 1500
+  }
+}

@@ -8,12 +8,12 @@
       "decimals": 18
     },
     "rpc": {
-      "primaryHttp": "https://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI",
+      "primaryHttp": "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
       "readHttp": [
         "https://rpc.ankr.com/eth/84fffbd4c54725874c4fc3a7deed918d54cc35d0ed5de3e5d7ab154c5edc7995",
         "https://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI",
-        "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
-        "https://ethereum-mainnet.core.chainstack.com/bb93999f25c7171092fccce64915c7c6"
+        "https://ethereum-mainnet.core.chainstack.com/bb93999f25c7171092fccce64915c7c6",
+        "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
       ],
       "broadcastHttp": [
         "https://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8",
@@ -21,17 +21,17 @@
         "https://rpc.ankr.com/eth/84fffbd4c54725874c4fc3a7deed918d54cc35d0ed5de3e5d7ab154c5edc7995",
         "https://ethereum-mainnet.core.chainstack.com/bb93999f25c7171092fccce64915c7c6"
       ],
-      "webSocket": "wss://lb.drpc.live/ethereum/AqviKb-BWE1GjLHjNxASBcL3fFyZT2YR8avttiKh6MJI"
+      "webSocket": "wss://eth-mainnet.g.alchemy.com/v2/WC4dci6O_8sfSmCwD22h8"
     }
   },
   "trigger": {
     "mode": "time",
     "startTimeIso": "2026-05-14T15:00:00.000Z",
-    "pollIntervalMs": 200,
-    "armBeforeMs": 4000,
-    "repriceBeforeMs": 900,
-    "countdownIntervalMs": 15000,
-    "finalSpinWindowMs": 125
+    "pollIntervalMs": 150,
+    "armBeforeMs": 5000,
+    "repriceBeforeMs": 750,
+    "countdownIntervalMs": 30000,
+    "finalSpinWindowMs": 100
   },
   "transaction": {
     "kind": "contractWrite",
@@ -48,6 +48,7 @@
   },
   "fees": {
     "type": "budgetAggressive",
+    "preset": "race",
     "targetUsd": 2.5,
     "assumedNativePriceUsd": 2500,
     "minFeeFloorGwei": 0.8,
@@ -61,14 +62,25 @@
       0.96
     ]
   },
+  "verification": {
+    "abi": [
+      "function balanceOf(address owner) view returns (uint256)"
+    ],
+    "functionName": "balanceOf",
+    "args": [
+      "__WALLET__"
+    ],
+    "operator": "gte",
+    "expected": 1
+  },
   "execution": {
     "walletCount": 1,
-    "replaceAfterMs": 4000,
-    "replaceMultiplier": 1.125,
+    "replaceAfterMs": 2200,
+    "replaceMultiplier": 1.15,
     "maxReplacementRounds": 3,
     "receiptTimeoutMs": 90000,
     "warmupRounds": 1,
-    "warmupDelayMs": 100,
+    "warmupDelayMs": 80,
     "minHealthyBroadcastRpc": 2,
     "minHealthyReadRpc": 2,
     "allowRiskyStandby": false,
