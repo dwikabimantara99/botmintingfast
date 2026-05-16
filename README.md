@@ -107,6 +107,7 @@ Catatan penting untuk `time` trigger:
 - kerja berat harus selesai sebelum waktu buka
 - untuk `5 wallet`, `repriceBeforeMs` di bawah kira-kira `1500-2000 ms` sering terlalu mepet
 - bot sekarang akan `skip final reprice` kalau refresh fee berisiko memakan jendela fire, karena lebih baik menembak tepat waktu daripada telat dengan fee yang lebih segar
+- bot sekarang juga punya `adaptive arm buffer`: kalau targetnya berat, bot boleh mulai fase arm lebih awal daripada angka `armBeforeMs` yang kamu tulis, supaya prep selesai sebelum open time
 
 ## Post-Mint Verification
 

@@ -880,8 +880,17 @@ async function collectValidationReport(
         "Timed reprice window",
         schedule.repriceAtMs !== null,
         schedule.repriceAtMs !== null
-          ? `Final reprice scheduled ${schedule.repriceBeforeMs} ms before mint open.`
-          : `repriceBeforeMs=${schedule.repriceBeforeMs} ms is too tight for armBeforeMs=${schedule.armBeforeMs} ms and finalSpinWindowMs=${schedule.finalSpinWindowMs} ms.`,
+          ? `Final reprice scheduled ${schedule.repriceBeforeMs} ms before mint open with effective armBeforeMs=${schedule.armBeforeMs} ms.`
+          : `repriceBeforeMs=${schedule.repriceBeforeMs} ms is too tight even after adaptive armBeforeMs=${schedule.armBeforeMs} ms and finalSpinWindowMs=${schedule.finalSpinWindowMs} ms.`,
+        "risk",
+      );
+    }
+    if (schedule) {
+      pushValidation(
+        results,
+        "Adaptive arm buffer",
+        schedule.armBeforeMs >= schedule.recommendedArmBeforeMs,
+        `configured=${schedule.configuredArmBeforeMs} ms, effective=${schedule.armBeforeMs} ms, recommended=${schedule.recommendedArmBeforeMs} ms, estimatedPrepBudget=${schedule.prepBudgetMs} ms`,
         "risk",
       );
     }
@@ -1159,6 +1168,14 @@ export async function runStandby(target: TargetConfig): Promise<void> {
   if (timeSchedule) {
     const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
     logger.info("Timed standby active. Bot will arm before mint opens.");
+    if (timeSchedule.armBeforeMs > timeSchedule.configuredArmBeforeMs) {
+      logger.info("Adaptive arm buffer expanded the prep window for this target.", {
+        configuredArmBeforeMs: timeSchedule.configuredArmBeforeMs,
+        effectiveArmBeforeMs: timeSchedule.armBeforeMs,
+        recommendedArmBeforeMs: timeSchedule.recommendedArmBeforeMs,
+        estimatedPrepBudgetMs: timeSchedule.prepBudgetMs,
+      });
+    }
     await waitForArmWindow(target, clockCalibration);
     const [, refreshedClockCalibration] = await Promise.all([
       withRpcOperationRetries(target, "Standby arm RPC ranking", () => client.refreshRanking()),

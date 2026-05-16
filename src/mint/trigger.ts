@@ -87,7 +87,10 @@ function normalizeAbi(abi: Abi | readonly string[]): Abi {
 export function getTimeTriggerConfig(target: TargetConfig): {
   startAtMs: number;
   armAtMs: number;
+  configuredArmBeforeMs: number;
+  recommendedArmBeforeMs: number;
   armBeforeMs: number;
+  prepBudgetMs: number;
   repriceBeforeMs: number | null;
   repriceAtMs: number | null;
   pollIntervalMs: number;
@@ -102,10 +105,23 @@ export function getTimeTriggerConfig(target: TargetConfig): {
     throw new Error("Invalid trigger.startTimeIso");
   }
 
-  const armBeforeMs = trigger.armBeforeMs ?? 4000;
+  const configuredArmBeforeMs = trigger.armBeforeMs ?? 4000;
   const finalSpinWindowMs = Math.max(10, trigger.finalSpinWindowMs ?? 125);
+  const walletCount = target.execution?.walletCount ?? 5;
+  const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
+  const warmupRounds = target.execution?.warmupRounds ?? 1;
   const rawRepriceBeforeMs = trigger.repriceBeforeMs ?? 900;
   const repriceBeforeMs = rawRepriceBeforeMs > 0 ? rawRepriceBeforeMs : null;
+  const prepBudgetMs =
+    2000 +
+    walletCount * (350 + replacementRounds * 120) +
+    Math.max(0, warmupRounds) * 250;
+  const recommendedArmBeforeMs = Math.max(
+    4500,
+    prepBudgetMs + (repriceBeforeMs ?? 0),
+    finalSpinWindowMs + 200,
+  );
+  const armBeforeMs = Math.max(configuredArmBeforeMs, recommendedArmBeforeMs);
   const candidateRepriceAtMs = repriceBeforeMs !== null ? startAtMs - repriceBeforeMs : null;
   const repriceAtMs =
     candidateRepriceAtMs !== null &&
@@ -118,7 +134,10 @@ export function getTimeTriggerConfig(target: TargetConfig): {
   return {
     startAtMs,
     armAtMs: startAtMs - Math.max(0, armBeforeMs),
+    configuredArmBeforeMs,
+    recommendedArmBeforeMs,
     armBeforeMs,
+    prepBudgetMs,
     repriceBeforeMs,
     repriceAtMs,
     pollIntervalMs: trigger.pollIntervalMs ?? 200,
@@ -152,6 +171,10 @@ export async function logClockStatusWithCalibration(
     latestBlockTimestampIso: new Date(latestBlockTimeMs).toISOString(),
     chainBlockAgeMs: calibratedNow - latestBlockTimeMs,
     armWindowOpensIso: new Date(schedule.armAtMs).toISOString(),
+    configuredArmBeforeMs: schedule.configuredArmBeforeMs,
+    effectiveArmBeforeMs: schedule.armBeforeMs,
+    recommendedArmBeforeMs: schedule.recommendedArmBeforeMs,
+    prepBudgetMs: schedule.prepBudgetMs,
     clockOffsetMs: calibration?.offsetMs ?? 0,
     clockObservedOffsetMs: calibration?.observedOffsetMs ?? 0,
     clockSampleCount: calibration?.sampleCount ?? 0,
