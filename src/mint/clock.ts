@@ -1,3 +1,5 @@
+import { hrtime } from "node:process";
+
 import { probeEndpoint } from "./broadcast.js";
 
 export type ClockCalibration = {
@@ -46,7 +48,7 @@ export async function calibrateClock(endpoints: string[]): Promise<ClockCalibrat
         : "low";
   const offsetMs = confidence === "high" ? observedOffsetMs : 0;
   const sampledAtMs = Date.now();
-  const perfSampledAt = performance.now();
+  const hrSampledAtNs = hrtime.bigint();
 
   return {
     offsetMs,
@@ -56,7 +58,7 @@ export async function calibrateClock(endpoints: string[]): Promise<ClockCalibrat
     sampledAtMs,
     source: healthyOffsets.length > 0 ? "rpc-date-header" : "local-clock",
     confidence,
-    nowMs: () => sampledAtMs + (performance.now() - perfSampledAt) + offsetMs,
+    nowMs: () => sampledAtMs + Number(hrtime.bigint() - hrSampledAtNs) / 1_000_000 + offsetMs,
     endpointSamples: probes.map((probe) => {
       const sample: {
         endpoint: string;

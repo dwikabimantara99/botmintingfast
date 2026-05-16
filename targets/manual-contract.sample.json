@@ -1,4 +1,5 @@
 {
+  "mintQuantityPerWallet": 1,
   "chain": {
     "id": 1,
     "name": "Ethereum",
@@ -28,8 +29,8 @@
     "mode": "time",
     "startTimeIso": "2026-05-14T15:00:00.000Z",
     "pollIntervalMs": 200,
-    "armBeforeMs": 4000,
-    "repriceBeforeMs": 900,
+    "armBeforeMs": 6000,
+    "repriceBeforeMs": 1800,
     "countdownIntervalMs": 15000,
     "finalSpinWindowMs": 125
   },
@@ -41,7 +42,7 @@
     ],
     "functionName": "mint",
     "args": [
-      1
+      "__MINT_QUANTITY__"
     ],
     "valueEth": "0.0008",
     "gasLimit": 220000
@@ -74,8 +75,9 @@
     "expected": 1
   },
   "execution": {
-    "walletCount": 1,
+    "walletCount": 5,
     "replaceAfterMs": 4000,
+    "receiptPollIntervalMs": 300,
     "replaceMultiplier": 1.125,
     "maxReplacementRounds": 3,
     "receiptTimeoutMs": 90000,

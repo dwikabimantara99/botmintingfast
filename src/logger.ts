@@ -4,6 +4,14 @@ function stamp(): string {
   return new Date().toISOString();
 }
 
+function stringifySafe(value: unknown): string {
+  return JSON.stringify(
+    value,
+    (_key, nestedValue) => (typeof nestedValue === "bigint" ? nestedValue.toString() : nestedValue),
+    2,
+  );
+}
+
 export function log(level: Level, message: string, data?: unknown): void {
   if (data === undefined) {
     console.log(`[${stamp()}] [${level}] ${message}`);
@@ -11,7 +19,7 @@ export function log(level: Level, message: string, data?: unknown): void {
   }
 
   console.log(`[${stamp()}] [${level}] ${message}`);
-  console.log(JSON.stringify(data, null, 2));
+  console.log(stringifySafe(data));
 }
 
 export const logger = {

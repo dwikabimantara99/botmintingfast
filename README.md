@@ -59,6 +59,19 @@ Pakai ini kalau kamu tahu:
 - args
 - value mint
 
+Kalau function mint memakai argumen quantity, pakai `mintQuantityPerWallet` di root target dan isi argumen dengan `__MINT_QUANTITY__`.
+
+Contoh:
+
+```json
+"mintQuantityPerWallet": 1,
+"transaction": {
+  "kind": "contractWrite",
+  "functionName": "mint",
+  "args": ["__MINT_QUANTITY__"]
+}
+```
+
 ### `rawTransaction`
 
 Pakai ini kalau kamu sudah punya:
@@ -78,6 +91,22 @@ Untuk `budgetAggressive`, sekarang kamu bisa pakai preset:
 - `allOut`
 
 Preset ini hanya memberi default tempur. Kalau kamu isi angka manual seperti `targetUsd` atau `maxFeeCapGwei`, nilai manual tetap menang.
+
+Tuning cepat yang penting:
+
+- `replaceAfterMs`: kapan bot mulai mengganti tx pending
+- `receiptPollIntervalMs`: seberapa sering bot mengecek receipt sebelum memutuskan replace
+- `armBeforeMs`: seberapa awal bot mulai build signing context, warmup, dan pre-sign ladder
+- `repriceBeforeMs`: seberapa dekat bot mencoba refresh fee sebelum waktu buka
+- `finalSpinWindowMs`: jendela busy-spin pendek tepat sebelum fire
+
+Untuk mode balap, angka kecil biasanya lebih agresif.
+
+Catatan penting untuk `time` trigger:
+
+- kerja berat harus selesai sebelum waktu buka
+- untuk `5 wallet`, `repriceBeforeMs` di bawah kira-kira `1500-2000 ms` sering terlalu mepet
+- bot sekarang akan `skip final reprice` kalau refresh fee berisiko memakan jendela fire, karena lebih baik menembak tepat waktu daripada telat dengan fee yang lebih segar
 
 ## Post-Mint Verification
 
@@ -110,6 +139,30 @@ Kalau receipt sukses, bot akan coba cek hasil mint itu lagi lewat contract read.
 - `readHttp`: bacaan nonce, simulation, fee, receipt
 - `broadcastHttp`: jalur blast raw tx
 - `webSocket`: block/event detection cepat
+
+## Private Relay
+
+Untuk Ethereum mainnet, bot sekarang bisa punya jalur tambahan `Flashbots private relay`.
+
+Tujuannya:
+
+- menambah jalur submit selain public mempool
+- mengurangi ketergantungan pada satu jenis path
+- tetap menjaga direct-contract/raw-tx flow yang sama
+
+Config opsional:
+
+```json
+"privateRelay": {
+  "kind": "flashbots",
+  "enabled": true,
+  "relayUrl": "https://relay.flashbots.net",
+  "maxBlocksInFuture": 2,
+  "authKeyEnv": "FLASHBOTS_AUTH_PRIVATE_KEY"
+}
+```
+
+`FLASHBOTS_AUTH_PRIVATE_KEY` sebaiknya key terpisah untuk relay reputation, bukan wallet dana utama.
 
 ## Workflow Operasional
 

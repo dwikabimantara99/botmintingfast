@@ -52,22 +52,28 @@ function normalizeAbi(abi: Abi | readonly string[]): Abi {
   return abi as Abi;
 }
 
-function replacePlaceholders(value: unknown, walletAddress: Hex, walletIndex: number): unknown {
+function replacePlaceholders(
+  value: unknown,
+  walletAddress: Hex,
+  walletIndex: number,
+  mintQuantityPerWallet: number,
+): unknown {
   if (typeof value === "string") {
     if (value === "__WALLET__") return walletAddress;
     if (value === "__INDEX__") return walletIndex;
+    if (value === "__MINT_QUANTITY__") return mintQuantityPerWallet;
     return value;
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => replacePlaceholders(item, walletAddress, walletIndex));
+    return value.map((item) => replacePlaceholders(item, walletAddress, walletIndex, mintQuantityPerWallet));
   }
 
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, nested]) => [
         key,
-        replacePlaceholders(nested, walletAddress, walletIndex),
+        replacePlaceholders(nested, walletAddress, walletIndex, mintQuantityPerWallet),
       ]),
     );
   }
@@ -127,11 +133,12 @@ async function readContractResult<T>(
 
 async function resolveOmnihubMintPayload(
   client: RpcReadClient,
+  rootTarget: TargetConfig,
   target: Extract<TargetConfig["transaction"], { kind: "omnihubCollectionMint" }>,
   walletAddress: Hex,
 ): Promise<ResolvedTransaction> {
   const contractVersion = await readContractResult<string>(client, target.to, "version");
-  const quantity = BigInt(target.quantity);
+  const quantity = BigInt(target.quantity ?? rootTarget.mintQuantityPerWallet ?? 1);
   const referralAddress = target.referralAddress ?? zeroAddress;
   const block = await client.getBlock();
   const nowSeconds = block.timestamp;
@@ -200,7 +207,10 @@ export async function buildTransactionPayload(
   const tx = target.transaction;
 
   if (tx.kind === "contractWrite") {
-    const resolvedArgs = (tx.args ?? []).map((arg) => replacePlaceholders(arg, walletAddress, walletIndex));
+    const mintQuantityPerWallet = target.mintQuantityPerWallet ?? 1;
+    const resolvedArgs = (tx.args ?? []).map((arg) =>
+      replacePlaceholders(arg, walletAddress, walletIndex, mintQuantityPerWallet),
+    );
     const data = encodeFunctionData({
       abi: normalizeAbi(tx.abi),
       functionName: tx.functionName,
@@ -217,7 +227,7 @@ export async function buildTransactionPayload(
   }
 
   if (tx.kind === "omnihubCollectionMint") {
-    return resolveOmnihubMintPayload(client, tx, walletAddress);
+    return resolveOmnihubMintPayload(client, target, tx, walletAddress);
   }
 
   return buildResolvedTransaction(

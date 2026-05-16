@@ -76,6 +76,7 @@ export type FeesConfig = {
 export type ExecutionConfig = {
   walletCount?: number;
   replaceAfterMs?: number;
+  receiptPollIntervalMs?: number;
   replaceMultiplier?: number;
   maxReplacementRounds?: number;
   receiptTimeoutMs?: number;
@@ -101,6 +102,7 @@ export type VerificationConfig = {
 };
 
 export type TargetConfig = {
+  mintQuantityPerWallet?: number;
   chain: {
     id: number;
     name: string;
@@ -121,6 +123,13 @@ export type TargetConfig = {
   fees: FeesConfig;
   execution?: ExecutionConfig;
   verification?: VerificationConfig;
+  privateRelay?: {
+    kind: "flashbots";
+    enabled?: boolean;
+    relayUrl?: string;
+    maxBlocksInFuture?: number;
+    authKeyEnv?: string;
+  };
 };
 
 export type WalletProfile = {
