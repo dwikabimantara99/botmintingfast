@@ -27,6 +27,7 @@ Bot ini adalah `execution bot`, bukan crawler website umum.
 - [src/mint/rpcMesh.ts](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/src/mint/rpcMesh.ts)
 - [targets/manual-contract.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-contract.sample.json)
 - [targets/manual-rawtx.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-rawtx.sample.json)
+- [targets/opensea-mainnet.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/opensea-mainnet.sample.json)
 - [targets/local-race.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/local-race.sample.json)
 
 ## Command Utama
@@ -82,6 +83,44 @@ Pakai ini kalau kamu sudah punya:
 
 Ini fallback paling universal untuk launchpad, router, atau marketplace route yang aneh.
 
+### `openseaDropMint`
+
+Pakai ini kalau target adalah OpenSea Drops dan kamu punya `collectionSlug`.
+
+Bot akan memanggil OpenSea Drops API saat fase prepare/arm untuk tiap wallet, mengambil `target`, `calldata`, dan `value`, lalu tetap menandatangani transaksi secara lokal dan broadcast lewat RPC stack kita.
+
+Contoh:
+
+```json
+"transaction": {
+  "kind": "openseaDropMint",
+  "collectionSlug": "my-collection-slug",
+  "quantity": 1,
+  "apiKeyEnv": "OPENSEA_API_KEY",
+  "gasLimit": 350000
+}
+```
+
+Catatan tempur: jangan memanggil OpenSea API di detik fire. Jalur ini sengaja mengambil route saat arm/rehearse, supaya saat FCFS open bot tinggal broadcast transaksi yang sudah ditandatangani.
+
+### `seaDropPublicMint`
+
+Pakai ini untuk OpenSea Drops yang memakai SeaDrop public mint. Ini jalur tempur yang lebih deterministik karena bot membaca konfigurasi public drop langsung dari contract SeaDrop, bukan dari UI.
+
+Contoh:
+
+```json
+"transaction": {
+  "kind": "seaDropPublicMint",
+  "nftContract": "0xCOLLECTION_CONTRACT",
+  "seaDrop": "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5",
+  "quantity": 1,
+  "gasLimit": 350000
+}
+```
+
+Bot akan membaca `getPublicDrop` dan `getAllowedFeeRecipients`, lalu membangun `mintPublic(...)` dengan `value` terbaru saat prepare/arm.
+
 ## Preset Fee Tempur
 
 Untuk `budgetAggressive`, sekarang kamu bisa pakai preset:
@@ -96,11 +135,13 @@ Tuning cepat yang penting:
 
 - `replaceAfterMs`: kapan bot mulai mengganti tx pending
 - `receiptPollIntervalMs`: seberapa sering bot mengecek receipt sebelum memutuskan replace
+- `broadcastBurstMs`: jadwal rebroadcast raw tx yang sama setelah tembakan utama, misalnya `[0, 80, 180]`
 - `armBeforeMs`: seberapa awal bot mulai build signing context, warmup, dan pre-sign ladder
 - `repriceBeforeMs`: seberapa dekat bot mencoba refresh fee sebelum waktu buka
 - `finalSpinWindowMs`: jendela busy-spin pendek tepat sebelum fire
 
 Untuk mode balap, angka kecil biasanya lebih agresif.
+Untuk local/Windows race mode, `finalSpinWindowMs` sekitar `300 ms` lebih stabil daripada `100 ms` karena bot masuk fase presisi lebih awal tanpa menambah kerja setelah waktu buka.
 
 Catatan penting untuk `time` trigger:
 
@@ -108,6 +149,8 @@ Catatan penting untuk `time` trigger:
 - untuk `5 wallet`, `repriceBeforeMs` di bawah kira-kira `1500-2000 ms` sering terlalu mepet
 - bot sekarang akan `skip final reprice` kalau refresh fee berisiko memakan jendela fire, karena lebih baik menembak tepat waktu daripada telat dengan fee yang lebih segar
 - bot sekarang juga punya `adaptive arm buffer`: kalau targetnya berat, bot boleh mulai fase arm lebih awal daripada angka `armBeforeMs` yang kamu tulis, supaya prep selesai sebelum open time
+- jalur sign memakai local account signing langsung, bukan `walletClient.prepareTransactionRequest`, supaya tidak ada transport HTTP tersembunyi di proses signing
+- jalur public broadcast memakai HTTP keep-alive supaya koneksi RPC bisa dipakai ulang dan tidak mengulang handshake yang tidak perlu
 
 ## Post-Mint Verification
 
@@ -176,12 +219,19 @@ Urutan yang disarankan:
 5. jalankan `rehearse`
 6. kalau sehat, jalankan `standby` atau `fire`
 
+Arti status operator:
+
+- `READY`: boleh lanjut ke `rehearse` dan `standby`
+- `RISKY`: bot bisa jalan, tapi ada warning yang harus kamu sadari; `standby` hanya lanjut kalau `allowRiskyStandby=true`
+- `BLOCKED`: target tidak boleh dipakai; `validate` akan exit gagal dan `standby` menolak arm
+
 ## File `.env`
 
 Contoh minimum:
 
 ```env
 PRIVATE_KEYS=0xPRIVATE_KEY_1,0xPRIVATE_KEY_2
+OPENSEA_API_KEY=your_opensea_api_key
 RPC_REQUEST_TIMEOUT_MS=3500
 RECEIPT_TIMEOUT_MS=120000
 ```
@@ -199,6 +249,12 @@ Mulai dari:
 Mulai dari:
 
 - [targets/manual-rawtx.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/manual-rawtx.sample.json)
+
+### OpenSea Drops mainnet
+
+Mulai dari:
+
+- [targets/opensea-mainnet.sample.json](C:/Users/ACER/Documents/Codex/2026-05-14/halo-codex/targets/opensea-mainnet.sample.json)
 
 ### Local aggressive profile
 

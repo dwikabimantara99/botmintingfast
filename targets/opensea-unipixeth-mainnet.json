@@ -27,25 +27,19 @@
   },
   "trigger": {
     "mode": "time",
-    "startTimeIso": "2026-05-14T15:00:00.000Z",
+    "startTimeIso": "2026-05-22T18:00:00.000Z",
     "pollIntervalMs": 150,
-    "armBeforeMs": 6000,
-    "repriceBeforeMs": 1800,
-    "countdownIntervalMs": 30000,
+    "armBeforeMs": 9000,
+    "repriceBeforeMs": 2200,
+    "countdownIntervalMs": 15000,
     "finalSpinWindowMs": 300
   },
   "transaction": {
-    "kind": "contractWrite",
-    "to": "0x1111111111111111111111111111111111111111",
-    "abi": [
-      "function mint(uint256 quantity) payable"
-    ],
-    "functionName": "mint",
-    "args": [
-      "__MINT_QUANTITY__"
-    ],
-    "valueEth": "0.0008",
-    "gasLimit": 220000
+    "kind": "seaDropPublicMint",
+    "nftContract": "0xaccaa4c23d02de593cd86125fb2c0911cc6e4b94",
+    "seaDrop": "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5",
+    "quantity": 1,
+    "gasLimit": 350000
   },
   "fees": {
     "type": "budgetAggressive",
@@ -64,6 +58,7 @@
     ]
   },
   "verification": {
+    "contract": "0xaccaa4c23d02de593cd86125fb2c0911cc6e4b94",
     "abi": [
       "function balanceOf(address owner) view returns (uint256)"
     ],

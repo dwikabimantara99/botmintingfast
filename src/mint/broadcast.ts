@@ -1,3 +1,6 @@
+import { request as httpRequest, Agent as HttpAgent, type IncomingHttpHeaders } from "node:http";
+import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
+
 import type { Hex } from "viem";
 
 import { getRequestTimeoutMs } from "../config.js";
@@ -27,70 +30,128 @@ type RpcDetailedResult = {
   clockOffsetMs?: number;
 };
 
+type NativeRpcResponse = {
+  statusCode: number;
+  statusMessage: string;
+  headers: IncomingHttpHeaders;
+  body: string;
+};
+
+const httpAgent = new HttpAgent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+});
+
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+});
+
+function getHeaderValue(headers: IncomingHttpHeaders, name: string): string | undefined {
+  const value = headers[name];
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function postJsonRpc(endpoint: string, body: string, timeoutMs: number): Promise<NativeRpcResponse> {
+  const url = new URL(endpoint);
+  const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest;
+  const agent = url.protocol === "https:" ? httpsAgent : httpAgent;
+
+  return new Promise((resolve, reject) => {
+    const request = requestFn(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        agent,
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer | string) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        response.on("end", () => {
+          resolve({
+            statusCode: response.statusCode ?? 0,
+            statusMessage: response.statusMessage ?? "",
+            headers: response.headers,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`RPC timeout after ${timeoutMs} ms`));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
 async function rpcRequestDetailed(endpoint: string, method: string, params: unknown[]): Promise<RpcDetailedResult> {
   const timeoutMs = getRequestTimeoutMs();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const localStartedAt = Date.now();
   const perfStartedAt = performance.now();
 
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        id: Date.now(),
-        jsonrpc: "2.0",
-        method,
-        params,
-      }),
-      signal: controller.signal,
-    });
+  const response = await postJsonRpc(
+    endpoint,
+    JSON.stringify({
+      id: Date.now(),
+      jsonrpc: "2.0",
+      method,
+      params,
+    }),
+    timeoutMs,
+  );
+  const localFinishedAt = Date.now();
+  const latencyMs = Math.round(performance.now() - perfStartedAt);
 
-    const localFinishedAt = Date.now();
-    const latencyMs = Math.round(performance.now() - perfStartedAt);
-    const responseText = await response.text();
-    const payload = JSON.parse(responseText) as {
-      error?: { code?: number; message?: string };
-      result?: unknown;
-    };
-    const dateHeader = response.headers.get("date");
-    const serverTimeMs = dateHeader ? Date.parse(dateHeader) : undefined;
-    const midpointLocalMs = Math.round((localStartedAt + localFinishedAt) / 2);
-    const clockOffsetMs =
-      serverTimeMs !== undefined && !Number.isNaN(serverTimeMs) ? serverTimeMs - midpointLocalMs : undefined;
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    if (payload.error) {
-      throw new Error(payload.error.message ?? `RPC error code ${payload.error.code ?? "unknown"}`);
-    }
-
-    if (payload.result === undefined) {
-      throw new Error(`RPC response missing result for method ${method}`);
-    }
-
-    const result: RpcDetailedResult = {
-      result: payload.result,
-      latencyMs,
-    };
-
-    if (serverTimeMs !== undefined && !Number.isNaN(serverTimeMs)) {
-      result.serverTimeMs = serverTimeMs;
-    }
-
-    if (clockOffsetMs !== undefined && !Number.isNaN(clockOffsetMs)) {
-      result.clockOffsetMs = clockOffsetMs;
-    }
-
-    return result;
-  } finally {
-    clearTimeout(timer);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`);
   }
+
+  const payload = JSON.parse(response.body) as {
+    error?: { code?: number; message?: string };
+    result?: unknown;
+  };
+  const dateHeader = getHeaderValue(response.headers, "date");
+  const serverTimeMs = dateHeader ? Date.parse(dateHeader) : undefined;
+  const midpointLocalMs = Math.round((localStartedAt + localFinishedAt) / 2);
+  const clockOffsetMs =
+    serverTimeMs !== undefined && !Number.isNaN(serverTimeMs) ? serverTimeMs - midpointLocalMs : undefined;
+
+  if (payload.error) {
+    throw new Error(payload.error.message ?? `RPC error code ${payload.error.code ?? "unknown"}`);
+  }
+
+  if (payload.result === undefined) {
+    throw new Error(`RPC response missing result for method ${method}`);
+  }
+
+  const result: RpcDetailedResult = {
+    result: payload.result,
+    latencyMs,
+  };
+
+  if (serverTimeMs !== undefined && !Number.isNaN(serverTimeMs)) {
+    result.serverTimeMs = serverTimeMs;
+  }
+
+  if (clockOffsetMs !== undefined && !Number.isNaN(clockOffsetMs)) {
+    result.clockOffsetMs = clockOffsetMs;
+  }
+
+  return result;
 }
 
 async function rpcRequest(endpoint: string, method: string, params: unknown[]): Promise<unknown> {

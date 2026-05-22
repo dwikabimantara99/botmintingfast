@@ -26,7 +26,7 @@
     "armBeforeMs": 6000,
     "repriceBeforeMs": 1800,
     "countdownIntervalMs": 30000,
-    "finalSpinWindowMs": 100
+    "finalSpinWindowMs": 300
   },
   "transaction": {
     "kind": "contractWrite",
@@ -73,6 +73,11 @@
     "replaceAfterMs": 2200,
     "replaceMultiplier": 1.15,
     "maxReplacementRounds": 3,
+    "broadcastBurstMs": [
+      0,
+      80,
+      180
+    ],
     "receiptTimeoutMs": 90000,
     "warmupRounds": 1,
     "warmupDelayMs": 80,

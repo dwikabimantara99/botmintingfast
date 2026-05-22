@@ -155,6 +155,18 @@ function buildTransactionData(target: TargetConfig): { to: Hex; data: Hex; value
     );
   }
 
+  if (target.transaction.kind === "openseaDropMint") {
+    throw new Error(
+      "rpcStackCompare does not support dynamic openseaDropMint targets. Use validate/rehearse on the real target instead.",
+    );
+  }
+
+  if (target.transaction.kind === "seaDropPublicMint") {
+    throw new Error(
+      "rpcStackCompare does not support dynamic seaDropPublicMint targets. Use validate/rehearse on the real target instead.",
+    );
+  }
+
   const abi = target.transaction.abi.length > 0 && typeof target.transaction.abi[0] === "string"
     ? parseAbi(target.transaction.abi as unknown as readonly string[])
     : target.transaction.abi;

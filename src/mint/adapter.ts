@@ -1,6 +1,7 @@
 import {
   decodeFunctionResult,
   encodeFunctionData,
+  getAddress,
   parseAbi,
   parseEther,
   type Abi,
@@ -31,6 +32,9 @@ type OmnihubPhase = {
 const zeroMerkleRoot = `0x${"00".repeat(32)}` as Hex;
 const zeroAddress = "0x0000000000000000000000000000000000000000" as Hex;
 const millisecondsThreshold = 100_000_000_000n;
+const defaultOpenSeaApiBaseUrl = "https://api.opensea.io/api/v2";
+const defaultSeaDropAddress = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5" as Hex;
+const defaultSeaDropFeeRecipient = "0x0000a26b00c1F0DF003000390027140000fAa719" as Hex;
 
 const omnihubAbi = parseAbi([
   "function version() view returns (string)",
@@ -39,6 +43,21 @@ const omnihubAbi = parseAbi([
   "function calculateMintFee(uint256 _phaseId, uint256 _quantity) view returns (uint256)",
   "function mint(uint256 _phaseId, uint256 _quantity, address _referral, bytes32[] _merkleProof) payable",
 ]);
+
+const seaDropAbi = parseAbi([
+  "function getAllowedFeeRecipients(address nftContract) view returns (address[])",
+  "function getPublicDrop(address nftContract) view returns ((uint80 mintPrice,uint48 startTime,uint48 endTime,uint16 maxTotalMintableByWallet,uint16 feeBps,bool restrictFeeRecipients))",
+  "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
+]);
+
+type SeaDropPublicDrop = {
+  mintPrice: bigint;
+  startTime: number;
+  endTime: number;
+  maxTotalMintableByWallet: number;
+  feeBps: number;
+  restrictFeeRecipients: boolean;
+};
 
 function normalizeAbi(abi: Abi | readonly string[]): Abi {
   if (abi.length === 0) {
@@ -100,6 +119,97 @@ function buildResolvedTransaction(
   return result;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
+function parseWeiValue(value: unknown): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) return BigInt(value);
+  throw new Error(`OpenSea mint transaction returned invalid wei value: ${String(value)}`);
+}
+
+function assertHex(value: unknown, label: string): Hex {
+  if (typeof value === "string" && /^0x[0-9a-fA-F]*$/.test(value)) {
+    return value as Hex;
+  }
+
+  throw new Error(`OpenSea mint transaction returned invalid ${label}.`);
+}
+
+function getOpenSeaApiKey(envName: string): string {
+  const apiKey = process.env[envName]?.trim();
+  if (!apiKey) {
+    throw new Error(`${envName} is empty. Fill it in .env before using openseaDropMint.`);
+  }
+
+  return apiKey;
+}
+
+function normalizeOpenSeaMintResponse(responseBody: unknown): { to: Hex; data: Hex; value: bigint } {
+  if (!isRecord(responseBody)) {
+    throw new Error("OpenSea mint endpoint returned a non-object response.");
+  }
+
+  const transaction = isRecord(responseBody.transaction) ? responseBody.transaction : responseBody;
+  const target = transaction.target ?? transaction.to;
+  const calldata = transaction.calldata ?? transaction.data;
+  const value = transaction.value ?? 0;
+
+  return {
+    to: getAddress(assertHex(target, "target contract")) as Hex,
+    data: assertHex(calldata, "calldata"),
+    value: parseWeiValue(value),
+  };
+}
+
+async function fetchOpenSeaDropMintPayload(
+  apiBaseUrl: string,
+  collectionSlug: string,
+  apiKey: string,
+  walletAddress: Hex,
+  quantity: number,
+): Promise<{ to: Hex; data: Hex; value: bigint }> {
+  const endpoint = `${apiBaseUrl.replace(/\/$/, "")}/drops/${encodeURIComponent(collectionSlug)}/mint`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4_000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        minter: walletAddress,
+        quantity,
+      }),
+      signal: controller.signal,
+    });
+
+    const responseText = await response.text();
+    let payload: unknown;
+    try {
+      payload = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      throw new Error(`OpenSea mint endpoint returned invalid JSON: ${responseText.slice(0, 200)}`);
+    }
+
+    if (!response.ok) {
+      const detail = isRecord(payload)
+        ? String(payload.message ?? payload.error ?? responseText.slice(0, 200))
+        : responseText.slice(0, 200);
+      throw new Error(`OpenSea mint endpoint HTTP ${response.status}: ${detail}`);
+    }
+
+    return normalizeOpenSeaMintResponse(payload);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function normalizePhaseTimestamp(value: bigint): bigint {
   if (value > millisecondsThreshold) {
     return value / 1000n;
@@ -111,11 +221,12 @@ function normalizePhaseTimestamp(value: bigint): bigint {
 async function readContractResult<T>(
   client: RpcReadClient,
   targetAddress: Hex,
+  abi: Abi,
   functionName: string,
   args: readonly unknown[] = [],
 ): Promise<T> {
   const data = encodeFunctionData({
-    abi: omnihubAbi as Abi,
+    abi,
     functionName: functionName as never,
     args: args as never,
   });
@@ -125,10 +236,28 @@ async function readContractResult<T>(
   });
 
   return decodeFunctionResult({
-    abi: omnihubAbi as Abi,
+    abi,
     functionName: functionName as never,
     data: raw.data ?? "0x",
   }) as T;
+}
+
+async function readOmnihubContractResult<T>(
+  client: RpcReadClient,
+  targetAddress: Hex,
+  functionName: string,
+  args: readonly unknown[] = [],
+): Promise<T> {
+  return readContractResult(client, targetAddress, omnihubAbi as Abi, functionName, args);
+}
+
+async function readSeaDropContractResult<T>(
+  client: RpcReadClient,
+  seaDropAddress: Hex,
+  functionName: string,
+  args: readonly unknown[] = [],
+): Promise<T> {
+  return readContractResult(client, seaDropAddress, seaDropAbi as Abi, functionName, args);
 }
 
 async function resolveOmnihubMintPayload(
@@ -137,7 +266,7 @@ async function resolveOmnihubMintPayload(
   target: Extract<TargetConfig["transaction"], { kind: "omnihubCollectionMint" }>,
   walletAddress: Hex,
 ): Promise<ResolvedTransaction> {
-  const contractVersion = await readContractResult<string>(client, target.to, "version");
+  const contractVersion = await readOmnihubContractResult<string>(client, target.to, "version");
   const quantity = BigInt(target.quantity ?? rootTarget.mintQuantityPerWallet ?? 1);
   const referralAddress = target.referralAddress ?? zeroAddress;
   const block = await client.getBlock();
@@ -147,12 +276,12 @@ async function resolveOmnihubMintPayload(
   let selectedPhase: OmnihubPhase | undefined;
 
   if (selectedPhaseId !== undefined) {
-    selectedPhase = await readContractResult<OmnihubPhase>(client, target.to, "phases", [BigInt(selectedPhaseId)]);
+    selectedPhase = await readOmnihubContractResult<OmnihubPhase>(client, target.to, "phases", [BigInt(selectedPhaseId)]);
   } else {
-    const phaseCount = Number(await readContractResult<bigint>(client, target.to, "phaseCount"));
+    const phaseCount = Number(await readOmnihubContractResult<bigint>(client, target.to, "phaseCount"));
 
     for (let index = 0; index < phaseCount; index += 1) {
-      const phase = await readContractResult<OmnihubPhase>(client, target.to, "phases", [BigInt(index)]);
+      const phase = await readOmnihubContractResult<OmnihubPhase>(client, target.to, "phases", [BigInt(index)]);
       const phaseFrom = normalizePhaseTimestamp(phase.from);
       const phaseTo = normalizePhaseTimestamp(phase.to);
       if (nowSeconds >= phaseFrom && nowSeconds <= phaseTo) {
@@ -180,7 +309,7 @@ async function resolveOmnihubMintPayload(
     );
   }
 
-  const value = await readContractResult<bigint>(client, target.to, "calculateMintFee", [
+  const value = await readOmnihubContractResult<bigint>(client, target.to, "calculateMintFee", [
     BigInt(selectedPhaseId),
     quantity,
   ]);
@@ -196,6 +325,64 @@ async function resolveOmnihubMintPayload(
   }
 
   return buildResolvedTransaction(target.to, data, value, target.gasLimit, target.accessList);
+}
+
+async function resolveSeaDropPublicMintPayload(
+  client: RpcReadClient,
+  rootTarget: TargetConfig,
+  target: Extract<TargetConfig["transaction"], { kind: "seaDropPublicMint" }>,
+): Promise<ResolvedTransaction> {
+  const seaDropAddress = target.seaDrop ?? defaultSeaDropAddress;
+  const quantity = BigInt(target.quantity ?? rootTarget.mintQuantityPerWallet ?? 1);
+  if (quantity <= 0n) {
+    throw new Error(`Invalid SeaDrop quantity: ${quantity.toString()}`);
+  }
+
+  const publicDrop = await readSeaDropContractResult<SeaDropPublicDrop>(
+    client,
+    seaDropAddress,
+    "getPublicDrop",
+    [target.nftContract],
+  );
+
+  if (publicDrop.maxTotalMintableByWallet > 0 && quantity > BigInt(publicDrop.maxTotalMintableByWallet)) {
+    throw new Error(
+      `SeaDrop quantity ${quantity.toString()} exceeds maxTotalMintableByWallet ${publicDrop.maxTotalMintableByWallet}.`,
+    );
+  }
+
+  let feeRecipient = target.feeRecipient;
+  if (!feeRecipient && publicDrop.restrictFeeRecipients) {
+    const allowedFeeRecipients = await readSeaDropContractResult<Hex[]>(
+      client,
+      seaDropAddress,
+      "getAllowedFeeRecipients",
+      [target.nftContract],
+    );
+    feeRecipient = allowedFeeRecipients[0];
+    if (!feeRecipient) {
+      throw new Error("SeaDrop public mint restricts fee recipients, but no allowed fee recipient was found.");
+    }
+  }
+
+  const data = encodeFunctionData({
+    abi: seaDropAbi,
+    functionName: "mintPublic",
+    args: [
+      target.nftContract,
+      feeRecipient ?? defaultSeaDropFeeRecipient,
+      target.minterIfNotPayer ?? zeroAddress,
+      quantity,
+    ],
+  });
+
+  return buildResolvedTransaction(
+    seaDropAddress,
+    data,
+    publicDrop.mintPrice * quantity,
+    target.gasLimit,
+    target.accessList,
+  );
 }
 
 export async function buildTransactionPayload(
@@ -228,6 +415,27 @@ export async function buildTransactionPayload(
 
   if (tx.kind === "omnihubCollectionMint") {
     return resolveOmnihubMintPayload(client, target, tx, walletAddress);
+  }
+
+  if (tx.kind === "openseaDropMint") {
+    const quantity = tx.quantity ?? target.mintQuantityPerWallet ?? 1;
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new Error(`Invalid OpenSea mint quantity: ${quantity}`);
+    }
+
+    const payload = await fetchOpenSeaDropMintPayload(
+      tx.apiBaseUrl ?? defaultOpenSeaApiBaseUrl,
+      tx.collectionSlug,
+      getOpenSeaApiKey(tx.apiKeyEnv ?? "OPENSEA_API_KEY"),
+      walletAddress,
+      quantity,
+    );
+
+    return buildResolvedTransaction(payload.to, payload.data, payload.value, tx.gasLimit, tx.accessList);
+  }
+
+  if (tx.kind === "seaDropPublicMint") {
+    return resolveSeaDropPublicMintPayload(client, target, tx);
   }
 
   return buildResolvedTransaction(

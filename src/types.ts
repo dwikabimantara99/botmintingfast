@@ -51,6 +51,25 @@ export type TransactionConfig =
       accessList?: AccessList;
     }
   | {
+      kind: "openseaDropMint";
+      collectionSlug: string;
+      quantity?: number;
+      apiKeyEnv?: string;
+      apiBaseUrl?: string;
+      gasLimit?: number;
+      accessList?: AccessList;
+    }
+  | {
+      kind: "seaDropPublicMint";
+      nftContract: Hex;
+      seaDrop?: Hex;
+      quantity?: number;
+      feeRecipient?: Hex;
+      minterIfNotPayer?: Hex;
+      gasLimit?: number;
+      accessList?: AccessList;
+    }
+  | {
       kind: "rawTransaction";
       to: Hex;
       data: Hex;
@@ -82,6 +101,7 @@ export type ExecutionConfig = {
   receiptTimeoutMs?: number;
   warmupRounds?: number;
   warmupDelayMs?: number;
+  broadcastBurstMs?: number[];
   minHealthyBroadcastRpc?: number;
   minHealthyReadRpc?: number;
   allowRiskyStandby?: boolean;

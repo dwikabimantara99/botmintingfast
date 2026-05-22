@@ -57,21 +57,49 @@ function validateRpcConfig(target: TargetConfig): void {
 
 function validateTransactionConfig(target: TargetConfig): void {
   const transaction = target.transaction;
-  validateAddress(transaction.to, "transaction.to");
 
   if (transaction.kind === "contractWrite") {
+    validateAddress(transaction.to, "transaction.to");
     assert(transaction.abi.length > 0, "transaction.abi is required for contractWrite");
     assert(isNonEmptyString(transaction.functionName), "transaction.functionName is required for contractWrite");
   }
 
   if (transaction.kind === "rawTransaction") {
+    validateAddress(transaction.to, "transaction.to");
     assert(isNonEmptyString(transaction.data), "transaction.data is required for rawTransaction");
   }
 
   if (transaction.kind === "omnihubCollectionMint") {
+    validateAddress(transaction.to, "transaction.to");
     assert(transaction.quantity > 0, "transaction.quantity must be greater than 0");
     if (transaction.referralAddress) {
       validateAddress(transaction.referralAddress, "transaction.referralAddress");
+    }
+  }
+
+  if (transaction.kind === "openseaDropMint") {
+    assert(isNonEmptyString(transaction.collectionSlug), "transaction.collectionSlug is required for openseaDropMint");
+    if (transaction.quantity !== undefined) {
+      assert(transaction.quantity > 0, "transaction.quantity must be greater than 0");
+    }
+    if (transaction.apiKeyEnv !== undefined) {
+      assert(isNonEmptyString(transaction.apiKeyEnv), "transaction.apiKeyEnv must be a non-empty string");
+    }
+  }
+
+  if (transaction.kind === "seaDropPublicMint") {
+    validateAddress(transaction.nftContract, "transaction.nftContract");
+    if (transaction.seaDrop !== undefined) {
+      validateAddress(transaction.seaDrop, "transaction.seaDrop");
+    }
+    if (transaction.feeRecipient !== undefined) {
+      validateAddress(transaction.feeRecipient, "transaction.feeRecipient");
+    }
+    if (transaction.minterIfNotPayer !== undefined) {
+      validateAddress(transaction.minterIfNotPayer, "transaction.minterIfNotPayer");
+    }
+    if (transaction.quantity !== undefined) {
+      assert(transaction.quantity > 0, "transaction.quantity must be greater than 0");
     }
   }
 
@@ -221,15 +249,23 @@ export function loadAccounts(walletCount = 5) {
     throw new Error("PRIVATE_KEYS is empty. Fill your .env first.");
   }
 
-  const keys = serialized
+  const requestedWalletCount = Number.isFinite(walletCount) && walletCount > 0 ? Math.floor(walletCount) : 5;
+  const availableKeys = serialized
     .split(",")
     .map((key) => key.trim())
-    .filter(Boolean)
-    .slice(0, walletCount);
+    .filter(Boolean);
 
-  if (keys.length === 0) {
+  if (availableKeys.length === 0) {
     throw new Error("No valid private keys found in PRIVATE_KEYS.");
   }
+
+  if (availableKeys.length < requestedWalletCount) {
+    throw new Error(
+      `PRIVATE_KEYS only contains ${availableKeys.length} wallet(s), but execution.walletCount requires ${requestedWalletCount}.`,
+    );
+  }
+
+  const keys = availableKeys.slice(0, requestedWalletCount);
 
   return keys.map((key) => privateKeyToAccount(key as `0x${string}`));
 }

@@ -27,25 +27,19 @@
   },
   "trigger": {
     "mode": "time",
-    "startTimeIso": "2026-05-14T15:00:00.000Z",
+    "startTimeIso": "2026-05-22T13:00:00.000Z",
     "pollIntervalMs": 150,
-    "armBeforeMs": 6000,
-    "repriceBeforeMs": 1800,
-    "countdownIntervalMs": 30000,
+    "armBeforeMs": 9000,
+    "repriceBeforeMs": 2200,
+    "countdownIntervalMs": 15000,
     "finalSpinWindowMs": 300
   },
   "transaction": {
-    "kind": "contractWrite",
-    "to": "0x1111111111111111111111111111111111111111",
-    "abi": [
-      "function mint(uint256 quantity) payable"
-    ],
-    "functionName": "mint",
-    "args": [
-      "__MINT_QUANTITY__"
-    ],
-    "valueEth": "0.0008",
-    "gasLimit": 220000
+    "kind": "openseaDropMint",
+    "collectionSlug": "REPLACE_WITH_OPENSEA_COLLECTION_SLUG",
+    "quantity": 1,
+    "apiKeyEnv": "OPENSEA_API_KEY",
+    "gasLimit": 350000
   },
   "fees": {
     "type": "budgetAggressive",
@@ -64,6 +58,7 @@
     ]
   },
   "verification": {
+    "contract": "0x1111111111111111111111111111111111111111",
     "abi": [
       "function balanceOf(address owner) view returns (uint256)"
     ],

@@ -272,26 +272,25 @@ export async function waitForTimedCheckpoint(
   logger.success(`${label} reached.`);
 }
 
-export async function waitForPreciseFireWindow(target: TargetConfig, calibration?: ClockCalibration): Promise<void> {
+export async function waitForPreciseFireWindow(
+  target: TargetConfig,
+  calibration?: ClockCalibration,
+): Promise<{ targetMs: number; releasedAtMs: number; overshootMs: number } | null> {
   const schedule = getTimeTriggerConfig(target);
-  if (!schedule) return;
+  if (!schedule) return null;
 
   const msUntilFinalSpin = schedule.startAtMs - (calibration?.nowMs() ?? Date.now()) - schedule.finalSpinWindowMs;
   if (msUntilFinalSpin > 0) {
     await sleep(msUntilFinalSpin);
   }
 
-  const remainingBeforeSpin = schedule.startAtMs - (calibration?.nowMs() ?? Date.now());
-  if (remainingBeforeSpin > 0) {
-    logger.info("Final timing window active.", {
-      targetTimeIso: new Date(schedule.startAtMs).toISOString(),
-      remainingMs: remainingBeforeSpin,
-      spinWindowMs: schedule.finalSpinWindowMs,
-    });
-  }
-
   spinUntilTimestampWithCalibration(schedule.startAtMs, calibration);
-  logger.success("Exact fire time reached.");
+  const releasedAtMs = calibration?.nowMs() ?? Date.now();
+  return {
+    targetMs: schedule.startAtMs,
+    releasedAtMs,
+    overshootMs: releasedAtMs - schedule.startAtMs,
+  };
 }
 
 async function waitForBlockTriggerByPolling(client: RpcReadClient, targetBlock: bigint, pollIntervalMs: number): Promise<void> {

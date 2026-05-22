@@ -1,11 +1,8 @@
 import { hrtime } from "node:process";
 import {
-  createWalletClient,
   decodeFunctionResult,
-  defineChain,
   encodeFunctionData,
   formatEther,
-  http,
   keccak256,
   parseAbi,
   parseGwei,
@@ -13,6 +10,7 @@ import {
   type AccessList,
   type Account,
   type Hex,
+  type TransactionSerializable,
 } from "viem";
 
 import {
@@ -24,9 +22,15 @@ import { logger } from "../logger.js";
 import { emitTelemetrySafe, getTelemetryPath } from "../telemetry.js";
 import type { TargetConfig, WalletProfile } from "../types.js";
 import { buildTransactionPayload } from "./adapter.js";
-import { broadcastSignedTransaction, pingEndpoint, probeEndpoint, rankHealthyEndpoints } from "./broadcast.js";
+import {
+  broadcastSignedTransaction,
+  pingEndpoint,
+  probeEndpoint,
+  rankHealthyEndpoints,
+  type BroadcastResult,
+} from "./broadcast.js";
 import { calibrateClock, type ClockCalibration } from "./clock.js";
-import { submitPrivateRelayRound } from "./privateRelay.js";
+import { createPrivateRelaySubmitter, type PrivateRelaySubmitter } from "./privateRelay.js";
 import { createRpcMesh, isRetryableReadError, type RpcReadClient } from "./rpcMesh.js";
 import {
   getTimeTriggerConfig,
@@ -142,20 +146,6 @@ const receiptPollPresetDefaults = {
   allOut: 200,
 } as const;
 
-function buildChain(target: TargetConfig) {
-  return defineChain({
-    id: target.chain.id,
-    name: target.chain.name,
-    nativeCurrency: target.chain.nativeCurrency,
-    rpcUrls: {
-      default: {
-        http: [target.chain.rpc.primaryHttp],
-        webSocket: target.chain.rpc.webSocket ? [target.chain.rpc.webSocket] : undefined,
-      },
-    },
-  });
-}
-
 function getReceiptPollIntervalMs(target: TargetConfig): number {
   const configured = target.execution?.receiptPollIntervalMs;
   if (configured !== undefined) {
@@ -189,6 +179,10 @@ function elapsedMs(startedAtNs: bigint): number {
   return Number(hrtime.bigint() - startedAtNs) / 1_000_000;
 }
 
+function roundNumber(value: number, fractionDigits = 3): number {
+  return Number(value.toFixed(fractionDigits));
+}
+
 function scaleBigInt(value: bigint, multiplier: number): bigint {
   const basisPoints = Math.max(1, Math.round(multiplier * 10_000));
   return (value * BigInt(basisPoints)) / 10_000n;
@@ -204,6 +198,17 @@ function describeError(error: unknown): string {
   }
 
   return String(error);
+}
+
+function isFutureTimeTrigger(target: TargetConfig): boolean {
+  if (target.trigger.mode !== "time") return false;
+  const startTimeMs = Date.parse(target.trigger.startTimeIso);
+  return Number.isFinite(startTimeMs) && Date.now() < startTimeMs;
+}
+
+function isLikelyPreOpenRevert(target: TargetConfig, error: unknown): boolean {
+  if (!isFutureTimeTrigger(target)) return false;
+  return /revert|notactive|not active/i.test(describeError(error));
 }
 
 function replacePlaceholders(value: unknown, walletAddress: Hex, walletIndex: number): unknown {
@@ -271,7 +276,10 @@ async function runPostMintVerification(
   const args = (target.verification.args ?? []).map((arg) =>
     replacePlaceholders(arg, account.address, profile.index),
   );
-  const contract = target.verification.contract ?? target.transaction.to;
+  const contract = target.verification.contract ?? ("to" in target.transaction ? target.transaction.to : undefined);
+  if (!contract) {
+    throw new Error("verification.contract is required when the transaction target is resolved dynamically.");
+  }
   const abi = normalizeAbi(target.verification.abi);
   const data = encodeFunctionData({
     abi,
@@ -364,31 +372,43 @@ async function withRpcOperationRetries<T>(
 }
 
 function buildUnsignedRequest(
-  account: Account,
   payload: PayloadShape,
   nonce: number,
+  gasLimit: bigint,
   feeEnvelope: FeeEnvelope,
-) {
+  chainId: number,
+): TransactionSerializable {
   const request = {
-    account,
     to: payload.to,
     data: payload.data,
     value: payload.value,
-    gas: payload.gas,
-    accessList: payload.accessList,
+    gas: gasLimit,
     nonce,
+    chainId,
   };
 
   if (feeEnvelope.type === "eip1559") {
     return {
       ...request,
+      type: "eip1559",
+      accessList: payload.accessList,
       maxFeePerGas: feeEnvelope.maxFeePerGas,
       maxPriorityFeePerGas: feeEnvelope.maxPriorityFeePerGas,
     };
   }
 
+  if (payload.accessList !== undefined) {
+    return {
+      ...request,
+      type: "eip2930",
+      accessList: payload.accessList,
+      gasPrice: feeEnvelope.gasPrice,
+    };
+  }
+
   return {
     ...request,
+    type: "legacy",
     gasPrice: feeEnvelope.gasPrice,
   };
 }
@@ -427,6 +447,40 @@ function isLikelyPropagatedError(message?: string): boolean {
     normalized.includes("already imported") ||
     normalized.includes("nonce too low")
   );
+}
+
+function summarizeBroadcastResults(send: PreparedSend, results: BroadcastResult[]) {
+  const accepted = results.find((item) => item.ok && item.hash);
+  const firstError = results.find((item) => !item.ok)?.error;
+
+  return {
+    wallet: send.account.address,
+    profile: send.profile.label,
+    nonce: send.nonce,
+    hash: accepted?.hash,
+    acceptedEndpoint: accepted?.endpoint,
+    acceptedLatencyMs: accepted?.latencyMs,
+    okCount: results.filter((item) => item.ok).length,
+    errorCount: results.filter((item) => !item.ok).length,
+    firstError,
+  };
+}
+
+function getBroadcastBurstSchedule(target: TargetConfig): number[] {
+  const configured = target.execution?.broadcastBurstMs;
+  if (!configured || configured.length === 0) {
+    return [0];
+  }
+
+  const normalized = Array.from(
+    new Set(
+      [0, ...configured]
+        .map((delayMs) => Math.max(0, Math.floor(delayMs)))
+        .filter((delayMs) => Number.isFinite(delayMs) && delayMs <= 2_000),
+    ),
+  ).sort((left, right) => left - right);
+
+  return normalized.includes(0) ? normalized : [0, ...normalized];
 }
 
 async function sampleLiveFeeMarket(client: RpcReadClient, configuredPriorityFeePerGas?: bigint): Promise<LiveFeeMarket> {
@@ -625,12 +679,6 @@ async function createPreparedSendFromContext(
   liveFeeMarket?: LiveFeeMarket,
   replacementRound = 0,
 ): Promise<PreparedSend> {
-  const chain = buildChain(target);
-  const walletClient = createWalletClient({
-    account: context.account,
-    chain,
-    transport: http(target.chain.rpc.primaryHttp),
-  });
   const feeEnvelope = await resolveFeeEnvelope(
     client,
     target,
@@ -639,19 +687,23 @@ async function createPreparedSendFromContext(
     liveFeeMarket,
     replacementRound,
   );
-  const unsignedRequest = buildUnsignedRequest(context.account, context.payload, context.nonce, feeEnvelope);
-  const request = await walletClient.prepareTransactionRequest({
-    ...unsignedRequest,
-    chain,
-    parameters: ["gas", "type"],
-  });
-  const serializedTransaction = await walletClient.signTransaction(request);
+  if (!("signTransaction" in context.account) || typeof context.account.signTransaction !== "function") {
+    throw new Error(`Wallet ${context.account.address} is not a local signing account.`);
+  }
+  const unsignedRequest = buildUnsignedRequest(
+    context.payload,
+    context.nonce,
+    context.gasLimit,
+    feeEnvelope,
+    target.chain.id,
+  );
+  const serializedTransaction = await context.account.signTransaction(unsignedRequest);
 
   return {
     account: context.account,
     profile: context.profile,
     nonce: context.nonce,
-    gas: request.gas ?? context.gasLimit,
+    gas: context.gasLimit,
     serializedTransaction,
     transactionHash: keccak256(serializedTransaction),
   };
@@ -739,29 +791,35 @@ async function warmBroadcastEndpoints(target: TargetConfig): Promise<string[]> {
   return rankedEndpoints;
 }
 
-async function waitForReceiptOutcome(
+async function waitForAnyReceiptOutcome(
   client: RpcReadClient,
-  hash: Hex,
+  hashes: Hex[],
   timeoutMs: number,
   pollIntervalMs: number,
 ): Promise<ReceiptOutcome> {
+  const uniqueHashes = Array.from(new Set(hashes));
   const started = Date.now();
+  const fallbackHash = uniqueHashes[uniqueHashes.length - 1]!;
 
   while (Date.now() - started < timeoutMs) {
-    try {
-      const receipt = await client.getTransactionReceipt({ hash });
-      return {
-        status: receipt.status === "success" ? "success" : "reverted",
-        hash,
-      };
-    } catch {
-      await sleep(pollIntervalMs);
+    for (const hash of uniqueHashes) {
+      try {
+        const receipt = await client.getTransactionReceipt({ hash });
+        return {
+          status: receipt.status === "success" ? "success" : "reverted",
+          hash,
+        };
+      } catch {
+        // Keep scanning known replacement hashes until one is mined.
+      }
     }
+
+    await sleep(pollIntervalMs);
   }
 
   return {
     status: "pending",
-    hash,
+    hash: fallbackHash,
   };
 }
 
@@ -1041,12 +1099,22 @@ async function collectValidationReport(
         `estimateGas=${estimate.toString()}, configured gasLimit=${gasLimit.toString()}`,
       );
     } catch (error) {
-      pushValidation(
-        results,
-        "Gas estimate simulation",
-        false,
-        `estimateGas failed: ${describeError(error)}`,
-      );
+      if (isLikelyPreOpenRevert(target, error)) {
+        pushValidation(
+          results,
+          "Gas estimate simulation",
+          true,
+          `Deferred because this future time-gated mint reverts before open. configured gasLimit=${gasLimit.toString()}`,
+          "risk",
+        );
+      } else {
+        pushValidation(
+          results,
+          "Gas estimate simulation",
+          false,
+          `estimateGas failed: ${describeError(error)}`,
+        );
+      }
     }
 
     try {
@@ -1064,12 +1132,22 @@ async function collectValidationReport(
         "eth_call completed without revert at current state.",
       );
     } catch (error) {
-      pushValidation(
-        results,
-        "eth_call simulation",
-        false,
-        `eth_call failed: ${describeError(error)}`,
-      );
+      if (isLikelyPreOpenRevert(target, error)) {
+        pushValidation(
+          results,
+          "eth_call simulation",
+          true,
+          "Deferred because the mint is time-gated and is expected to revert before open.",
+          "risk",
+        );
+      } else {
+        pushValidation(
+          results,
+          "eth_call simulation",
+          false,
+          `eth_call failed: ${describeError(error)}`,
+        );
+      }
     }
   }
 
@@ -1132,6 +1210,7 @@ export async function runValidate(target: TargetConfig): Promise<void> {
   }
 
   logger.warn("Validation is blocked. Fix the blocking issues before the competition.");
+  throw new Error("Validation is BLOCKED. Refusing to report this target as runnable.");
 }
 
 export async function runStandby(target: TargetConfig): Promise<void> {
@@ -1196,11 +1275,17 @@ export async function runStandby(target: TargetConfig): Promise<void> {
     );
     const signingContextBuildMs = elapsedMs(signingContextStartedAt);
     const initialLadderStartedAt = hrtime.bigint();
-    const [rankedEndpoints, initialLadders] = await Promise.all([
+    const [rankedEndpoints, initialLadders, privateRelaySubmitter] = await Promise.all([
       warmBroadcastEndpoints(target),
       withRpcOperationRetries(target, "Standby ladder build", () =>
         buildPreparedLaddersFromContexts(client, target, signingContexts, replacementRounds),
       ),
+      createPrivateRelaySubmitter(target).catch((error) => {
+        logger.warn("Private relay setup failed. Continuing with public RPC broadcast only.", {
+          error: describeError(error),
+        });
+        return null;
+      }),
     ]);
     const initialLadderBuildMs = elapsedMs(initialLadderStartedAt);
     let ladders = initialLadders;
@@ -1286,8 +1371,17 @@ export async function runStandby(target: TargetConfig): Promise<void> {
     }
 
     const prepared = Array.from(ladders.values()).map((ladder) => ladder[0]!);
-    await waitForPreciseFireWindow(target, fireCalibration);
-    await executePreparedRounds(target, client, prepared, ladders, rankedEndpoints);
+    const fireTiming = await waitForPreciseFireWindow(target, fireCalibration);
+    await executePreparedRounds(
+      target,
+      client,
+      prepared,
+      ladders,
+      rankedEndpoints,
+      privateRelaySubmitter ?? undefined,
+      fireTiming ?? undefined,
+      fireCalibration,
+    );
     return;
   }
 
@@ -1335,26 +1429,77 @@ async function executePreparedRounds(
   initialPrepared: PreparedSend[],
   preSignedLadders?: PreparedLadders,
   broadcastEndpoints?: string[],
+  privateRelaySubmitter?: PrivateRelaySubmitter,
+  fireTiming?: { targetMs: number; releasedAtMs: number; overshootMs: number },
+  fireCalibration?: ClockCalibration,
 ): Promise<void> {
   let prepared = initialPrepared;
   let bestHashes = new Map<number, Hex>();
+  const hashHistory = new Map<number, Set<Hex>>();
+  const bestSends = new Map<number, PreparedSend>(
+    initialPrepared.map((send) => [send.profile.index, send]),
+  );
   const replacementDelay = target.execution?.replaceAfterMs ?? 4000;
   const receiptPollIntervalMs = getReceiptPollIntervalMs(target);
   const replacementRounds = target.execution?.maxReplacementRounds ?? 3;
   const receiptTimeout = target.execution?.receiptTimeoutMs ?? getDefaultReceiptTimeoutMs();
   const terminalStates = new Map<number, ReceiptOutcome>();
+  const verificationStates = new Map<number, VerificationResult | null>();
   const activeBroadcastEndpoints = broadcastEndpoints ?? target.chain.rpc.broadcastHttp;
+  const broadcastBurstSchedule = getBroadcastBurstSchedule(target);
+
+  function recordHash(walletIndex: number, hash: Hex): void {
+    const history = hashHistory.get(walletIndex) ?? new Set<Hex>();
+    history.add(hash);
+    hashHistory.set(walletIndex, history);
+    bestHashes.set(walletIndex, hash);
+  }
+
+  async function verifyConfirmedWallets(
+    confirmed: Array<{ send: PreparedSend; outcome: ReceiptOutcome }>,
+  ): Promise<Array<{ wallet: Hex; profile: string; verification: VerificationResult | null }>> {
+    const verificationResults = await Promise.all(
+      confirmed.map(async (item) => ({
+        wallet: item.send.account.address,
+        profile: item.send.profile.label,
+        verification: await runPostMintVerification(target, client, item.send.account, item.send.profile).catch(
+          (error) => ({
+            ok: false,
+            details: describeError(error),
+          }),
+        ),
+      })),
+    );
+
+    for (const item of confirmed) {
+      const result = verificationResults.find((verification) => verification.profile === item.send.profile.label);
+      if (result) {
+        verificationStates.set(item.send.profile.index, result.verification);
+      }
+    }
+
+    return verificationResults;
+  }
 
   for (let round = 0; round <= replacementRounds; round += 1) {
     if (prepared.length === 0) {
       break;
     }
 
-    logger.info(`Broadcast round ${round + 1} started.`);
-
-    const [perWalletResults, privateRelayResults] = await Promise.all([
-      Promise.all(
+    const broadcastStartedAtMs = fireCalibration?.nowMs() ?? Date.now();
+    const broadcastStartedAtNs = hrtime.bigint();
+    const publicBroadcastPromise = Promise.all(
       prepared.map(async (send) => {
+        for (const followupDelayMs of broadcastBurstSchedule.slice(1)) {
+          if (followupDelayMs <= 0) continue;
+          void (async () => {
+            await sleep(followupDelayMs);
+            await broadcastSignedTransaction(activeBroadcastEndpoints, send.serializedTransaction);
+          })().catch(() => {
+            // Burst rebroadcast is best-effort; the first accepted hash is enough for tracking.
+          });
+        }
+
         const results = await broadcastSignedTransaction(activeBroadcastEndpoints, send.serializedTransaction);
         const winner = results.find((item) => item.ok && item.hash);
         const inferredHash =
@@ -1362,50 +1507,89 @@ async function executePreparedRounds(
           (results.some((item) => isLikelyPropagatedError(item.error)) ? send.transactionHash : undefined);
         return { send, results, inferredHash };
       }),
-      ),
-      submitPrivateRelayRound(
-        target,
-        prepared.map((send) => send.serializedTransaction),
-      ),
-    ]);
+    );
 
-    for (const item of perWalletResults) {
-      logger.info(`Wallet ${item.send.profile.label} broadcast results.`, {
-        wallet: item.send.account.address,
-        nonce: item.send.nonce,
-        results: item.results,
-      });
+    logger.info(`Broadcast round ${round + 1} started.`, {
+      walletCount: prepared.length,
+      ...(round === 0 && fireTiming
+        ? {
+            targetOpenToWaitReleaseMs: roundNumber(fireTiming.overshootMs, 3),
+            targetOpenToBroadcastStartMs: roundNumber(broadcastStartedAtMs - fireTiming.targetMs, 3),
+            waitReleaseToBroadcastStartMs: roundNumber(broadcastStartedAtMs - fireTiming.releasedAtMs, 3),
+          }
+        : {}),
+    });
 
-      if (item.inferredHash) {
-        bestHashes.set(item.send.profile.index, item.inferredHash);
-      }
+    if (privateRelaySubmitter?.enabled) {
+      const relayTransactions = prepared.map((send) => send.serializedTransaction);
+      void privateRelaySubmitter
+        .submitRound(relayTransactions)
+        .then((privateRelayResults) => {
+          logger.info(`Private relay round ${round + 1} submitted.`, {
+            okCount: privateRelayResults.filter((item) => item.ok).length,
+            errorCount: privateRelayResults.filter((item) => !item.ok).length,
+            results: privateRelayResults.map((item) => ({
+              ok: item.ok,
+              relay: item.relay,
+              hash: item.hash,
+              targetBlockNumber: item.targetBlockNumber,
+              error: item.error,
+            })),
+          });
+          emitTelemetrySafe("private_relay_round", {
+            round: round + 1,
+            privateRelayResults,
+          });
+        })
+        .catch((error) => {
+          logger.warn(`Private relay round ${round + 1} failed in background.`, {
+            error: describeError(error),
+          });
+          emitTelemetrySafe("private_relay_round_failed", {
+            round: round + 1,
+            error: describeError(error),
+          });
+        });
     }
+
+    const perWalletResults = await publicBroadcastPromise;
+
+    const broadcastSummaries = perWalletResults.map((item) => summarizeBroadcastResults(item.send, item.results));
+    const broadcastDurationMs = elapsedMs(broadcastStartedAtNs);
+    for (const item of perWalletResults) {
+      recordHash(item.send.profile.index, item.inferredHash ?? item.send.transactionHash);
+      bestSends.set(item.send.profile.index, item.send);
+    }
+    logger.info(`Broadcast round ${round + 1} results.`, {
+      durationMs: roundNumber(broadcastDurationMs, 3),
+      burstScheduleMs: broadcastBurstSchedule,
+      wallets: broadcastSummaries,
+    });
 
     emitTelemetrySafe("broadcast_round", {
       round: round + 1,
       activeBroadcastEndpoints,
-      privateRelayResults,
-      perWalletResults: perWalletResults.map((item) => ({
-        wallet: item.send.account.address,
-        profile: item.send.profile.label,
-        nonce: item.send.nonce,
-        inferredHash: item.inferredHash,
-        results: item.results,
-      })),
+      durationMs: broadcastDurationMs,
+      burstScheduleMs: broadcastBurstSchedule,
+      fireTiming:
+        round === 0 && fireTiming
+          ? {
+              ...fireTiming,
+              targetOpenToBroadcastStartMs: broadcastStartedAtMs - fireTiming.targetMs,
+              waitReleaseToBroadcastStartMs: broadcastStartedAtMs - fireTiming.releasedAtMs,
+            }
+          : undefined,
+      perWalletResults: broadcastSummaries,
     });
-
-    if (privateRelayResults.length > 0) {
-      logger.info(`Private relay round ${round + 1} results.`, privateRelayResults);
-    }
 
     const receiptChecks = await Promise.all(
       prepared.map(async (send) => {
-        const hash = bestHashes.get(send.profile.index) ?? send.transactionHash;
+        const hashes = Array.from(hashHistory.get(send.profile.index) ?? new Set([send.transactionHash]));
         return {
           send,
-          outcome: await waitForReceiptOutcome(
+          outcome: await waitForAnyReceiptOutcome(
             client,
-            hash,
+            hashes,
             Math.min(replacementDelay, receiptTimeout),
             receiptPollIntervalMs,
           ),
@@ -1422,19 +1606,8 @@ async function executePreparedRounds(
     }
 
     if (confirmedSuccess.length > 0) {
-      const verificationResults = await Promise.all(
-        confirmedSuccess.map(async (item) => ({
-          wallet: item.send.account.address,
-          profile: item.send.profile.label,
-          verification: await runPostMintVerification(target, client, item.send.account, item.send.profile).catch(
-            (error) => ({
-              ok: false,
-              details: describeError(error),
-            }),
-          ),
-        })),
-      );
-      logger.success("At least one wallet confirmed successfully.", {
+      const verificationResults = await verifyConfirmedWallets(confirmedSuccess);
+      logger.success("Some wallets confirmed successfully. Pending wallets will keep racing.", {
         confirmedWallets: confirmedSuccess.map((item) => ({
           wallet: item.send.account.address,
           profile: item.send.profile.label,
@@ -1442,6 +1615,11 @@ async function executePreparedRounds(
         })),
         verificationResults,
         revertedWallets: reverted.map((item) => ({
+          wallet: item.send.account.address,
+          profile: item.send.profile.label,
+          hash: item.outcome.hash,
+        })),
+        pendingWallets: pending.map((item) => ({
           wallet: item.send.account.address,
           profile: item.send.profile.label,
           hash: item.outcome.hash,
@@ -1459,8 +1637,12 @@ async function executePreparedRounds(
           profile: item.send.profile.label,
           hash: item.outcome.hash,
         })),
+        pendingWallets: pending.map((item) => ({
+          wallet: item.send.account.address,
+          profile: item.send.profile.label,
+          hash: item.outcome.hash,
+        })),
       });
-      return;
     }
 
     if (reverted.length > 0) {
@@ -1490,9 +1672,27 @@ async function executePreparedRounds(
 
     logger.warn("No confirmation yet. Repricing and replacing pending transactions.");
     if (preSignedLadders) {
-      prepared = pending
-        .map((item) => preSignedLadders.get(item.send.profile.index)?.[round + 1])
+      const nextPrepared = pending
+        .map((item) => ({
+          previous: item,
+          next: preSignedLadders.get(item.send.profile.index)?.[round + 1],
+        }));
+      const missingReplacement = nextPrepared.filter((item) => item.next === undefined);
+      if (missingReplacement.length > 0) {
+        logger.warn("Some pending wallets have no pre-signed replacement left.", {
+          wallets: missingReplacement.map((item) => ({
+            wallet: item.previous.send.account.address,
+            profile: item.previous.send.profile.label,
+            hash: item.previous.outcome.hash,
+          })),
+        });
+      }
+      prepared = nextPrepared
+        .map((item) => item.next)
         .filter((item): item is PreparedSend => item !== undefined);
+      for (const send of prepared) {
+        bestSends.set(send.profile.index, send);
+      }
       continue;
     }
 
@@ -1513,23 +1713,30 @@ async function executePreparedRounds(
         ),
       ),
     );
+    for (const send of prepared) {
+      bestSends.set(send.profile.index, send);
+    }
   }
 
   const finalChecks = await Promise.all(
-    Array.from(bestHashes.entries()).map(async ([walletIndex, hash]) => ({
-      walletIndex,
-      hash,
-      outcome:
-        terminalStates.get(walletIndex) ??
-        (await waitForReceiptOutcome(client, hash, receiptTimeout, receiptPollIntervalMs)),
-    })),
+    Array.from(hashHistory.entries()).map(async ([walletIndex, hashes]) => {
+      const hashList = Array.from(hashes);
+      const fallbackHash = bestHashes.get(walletIndex) ?? hashList[hashList.length - 1]!;
+      return {
+        walletIndex,
+        hash: fallbackHash,
+        outcome:
+          terminalStates.get(walletIndex) ??
+          (await waitForAnyReceiptOutcome(client, hashList, receiptTimeout, receiptPollIntervalMs)),
+      };
+    }),
   );
 
   const lateSuccess = finalChecks.filter((item) => item.outcome.status === "success");
   if (lateSuccess.length > 0) {
     const lateVerificationResults = await Promise.all(
       lateSuccess.map(async (item) => {
-        const matched = prepared.find((send) => send.profile.index === item.walletIndex);
+        const matched = bestSends.get(item.walletIndex);
         if (!matched) {
           return {
             walletIndex: item.walletIndex,
@@ -1539,16 +1746,16 @@ async function executePreparedRounds(
 
         return {
           walletIndex: item.walletIndex,
-          verification: await runPostMintVerification(target, client, matched.account, matched.profile).catch(
-            (error) => ({
+          verification:
+            verificationStates.get(item.walletIndex) ??
+            (await runPostMintVerification(target, client, matched.account, matched.profile).catch((error) => ({
               ok: false,
               details: describeError(error),
-            }),
-          ),
+            }))),
         };
       }),
     );
-    logger.success("Fire sequence confirmed successfully after the early confirmation window.", {
+    logger.success("Fire sequence completed with confirmed wallet outcomes.", {
       finalChecks,
       verificationResults: lateVerificationResults,
     });
@@ -1573,16 +1780,22 @@ export async function runFire(target: TargetConfig, providedClient?: RpcReadClie
   }
 
   logger.info("Preparing signed transactions.");
-  const [signingContexts, liveFeeMarket, rankedEndpoints] = await Promise.all([
+  const [signingContexts, liveFeeMarket, rankedEndpoints, privateRelaySubmitter] = await Promise.all([
     buildSigningContexts(client, target, accounts, profiles),
     sampleLiveFeeMarket(
       client,
       target.fees.priorityFeeGwei !== undefined ? parseGwei(String(target.fees.priorityFeeGwei)) : undefined,
     ),
     warmBroadcastEndpoints(target),
+    createPrivateRelaySubmitter(target).catch((error) => {
+      logger.warn("Private relay setup failed. Continuing with public RPC broadcast only.", {
+        error: describeError(error),
+      });
+      return null;
+    }),
   ]);
   const prepared = await Promise.all(
     signingContexts.map((context) => createPreparedSendFromContext(client, target, context, liveFeeMarket)),
   );
-  await executePreparedRounds(target, client, prepared, undefined, rankedEndpoints);
+  await executePreparedRounds(target, client, prepared, undefined, rankedEndpoints, privateRelaySubmitter ?? undefined);
 }
